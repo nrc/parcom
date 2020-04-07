@@ -5,13 +5,13 @@ use std::{
     thread,
 };
 
-pub fn new<T: Receiver>(t: Arc<T>) -> (TransportSend, TransportRecv<T>) {
+pub fn new<T: Receiver>() -> (TransportSend, TransportRecv<T>) {
     let (send, recv) = mpsc::channel();
     (
         TransportSend { channel: send },
         TransportRecv {
             channel: recv,
-            recv: t,
+            recv: None,
         },
     )
 }
@@ -23,7 +23,7 @@ pub struct TransportSend {
 
 pub struct TransportRecv<T: Receiver> {
     channel: mpsc::Receiver<Box<dyn any::Any + Send>>,
-    recv: Arc<T>,
+    recv: Option<Arc<T>>,
 }
 
 impl TransportSend {
@@ -35,13 +35,17 @@ impl TransportSend {
 }
 
 impl<T: Receiver + 'static> TransportRecv<T> {
+    pub fn set_handler(&mut self, t: Arc<T>) {
+        self.recv = Some(t);
+    }
+
     pub fn listen(self) {
         thread::spawn(move || loop {
             if let Err(_) = self
                 .channel
                 .recv()
                 .map_err(|e| e.to_string())
-                .and_then(|msg| self.recv.recv_msg(msg))
+                .and_then(|msg| self.recv.as_ref().unwrap().recv_msg(msg))
             {
                 return;
             }
@@ -54,15 +58,58 @@ pub trait Receiver: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
-pub struct LockMsg {
+pub struct LockRequest {
     pub key: Key,
     pub start_ts: Ts,
     pub for_update_ts: Ts,
 }
 
+impl LockRequest {
+    pub fn ack(&self) -> LockAck {
+        LockAck {
+            key: self.key,
+            start_ts: self.start_ts,
+        }
+    }
+
+    pub fn response(&self, success: bool) -> LockResponse {
+        LockResponse {
+            key: self.key,
+            start_ts: self.start_ts,
+            success,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct PrewriteMsg {
+pub struct LockAck {
+    pub key: Key,
+    pub start_ts: Ts,
+}
+
+#[derive(Debug, Clone)]
+pub struct LockResponse {
+    pub key: Key,
+    pub start_ts: Ts,
+    // FIXME needs more detail if we want to retry
+    pub success: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrewriteRequest {
     pub start_ts: Ts,
     pub commit_ts: Ts,
     pub writes: Vec<(Key, Value)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrewriteAck {
+    pub start_ts: Ts,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrewriteResponse {
+    pub start_ts: Ts,
+    // FIXME needs more detail if we want to retry
+    pub success: bool,
 }

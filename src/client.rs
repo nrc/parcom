@@ -1,9 +1,6 @@
 use crate::*;
 use rand::{self, Rng};
-use std::{
-    collections::HashMap,
-    sync::Mutex,
-};
+use std::{any, collections::HashMap, sync::Mutex};
 
 pub struct Client {
     txns: Mutex<HashMap<Ts, Txn>>,
@@ -27,11 +24,13 @@ impl Client {
             self.exec_lock(start_ts);
         }
         self.exec_prewrite(start_ts);
+        // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
+        // TODO block waiting for responses.
     }
 
     fn exec_lock(&self, start_ts: Ts) {
         let key = random_key();
-        let msg = transport::LockMsg {
+        let msg = transport::LockRequest {
             key,
             start_ts,
             for_update_ts: self.tso.ts(),
@@ -43,12 +42,29 @@ impl Client {
         let writes = (0..WRITES_PER_TXN)
             .map(|_| (random_key(), random_value()))
             .collect();
-        let msg = transport::PrewriteMsg {
+        let msg = transport::PrewriteRequest {
             start_ts,
             commit_ts: self.tso.ts(),
             writes,
         };
+        // TODO handle closed channel by shutting down
         self.transport.send(Box::new(msg)).unwrap();
+    }
+}
+
+unsafe impl Sync for Client {}
+
+impl transport::Receiver for Client {
+    fn recv_msg(&self, msg: Box<dyn any::Any + Send>) -> Result<(), String> {
+        let msg = match msg.downcast::<transport::LockAck>() {
+            Ok(_) => return Ok(()),
+            Err(msg) => msg,
+        };
+        let msg = match msg.downcast::<transport::PrewriteAck>() {
+            Ok(_) => return Ok(()),
+            Err(msg) => msg,
+        };
+        Err(format!("Unknown message type: {:?}", msg.type_id()))
     }
 }
 

@@ -6,6 +6,7 @@
 // server replies
 // recovery
 // reads
+// multiple clients and servers
 //
 // Constraints
 //
@@ -28,7 +29,6 @@ const READS_PER_TXN: usize = 10;
 const WRITES_PER_TXN: usize = 10;
 const TXNS: usize = 100;
 const MAX_KEY: u64 = 1000;
-
 
 #[derive(Debug, Clone)]
 pub struct Tso {
@@ -54,15 +54,19 @@ impl Tso {
 pub struct Key(u64);
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Ts(u64);
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub struct Value(u64);
 
 pub fn start() {
     let tso = Tso::new();
-    let server = Arc::new(server::Server::new());
-    let (send, recv) = transport::new(server);
-    let client = client::Client::new(tso.clone(), send);
-    recv.listen();
+    let (send1, mut recv1) = transport::new();
+    let (send2, mut recv2) = transport::new();
+    let server = Arc::new(server::Server::new(send1));
+    let client = Arc::new(client::Client::new(tso.clone(), send2));
+    recv1.set_handler(client.clone());
+    recv2.set_handler(server.clone());
+    recv1.listen();
+    recv2.listen();
 
     for _ in 0..TXNS {
         client.exec_txn();
