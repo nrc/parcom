@@ -69,6 +69,8 @@ pub fn start() {
     recv2.listen();
 
     for _ in 0..TXNS {
-        client.exec_txn();
+        if let Err(_) = client.exec_txn() {
+            return;
+        }
     }
 }

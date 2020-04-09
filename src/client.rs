@@ -17,28 +17,28 @@ impl Client {
         }
     }
 
-    pub fn exec_txn(&self) {
+    pub fn exec_txn(&self) -> Result<(), String> {
         let start_ts = self.tso.ts();
         self.txns.lock().unwrap().insert(start_ts, Txn {});
         for _ in 0..READS_PER_TXN {
-            self.exec_lock(start_ts);
+            self.exec_lock(start_ts)?;
         }
-        self.exec_prewrite(start_ts);
+        self.exec_prewrite(start_ts)
         // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
         // TODO block waiting for responses.
     }
 
-    fn exec_lock(&self, start_ts: Ts) {
+    fn exec_lock(&self, start_ts: Ts) -> Result<(), String> {
         let key = random_key();
         let msg = transport::LockRequest {
             key,
             start_ts,
             for_update_ts: self.tso.ts(),
         };
-        self.transport.send(Box::new(msg)).unwrap();
+        self.transport.send(Box::new(msg)).map_err(|e| e.to_string())
     }
 
-    fn exec_prewrite(&self, start_ts: Ts) {
+    fn exec_prewrite(&self, start_ts: Ts) -> Result<(), String> {
         let writes = (0..WRITES_PER_TXN)
             .map(|_| (random_key(), random_value()))
             .collect();
@@ -47,8 +47,7 @@ impl Client {
             commit_ts: self.tso.ts(),
             writes,
         };
-        // TODO handle closed channel by shutting down
-        self.transport.send(Box::new(msg)).unwrap();
+        self.transport.send(Box::new(msg)).map_err(|e| e.to_string())
     }
 }
 

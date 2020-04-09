@@ -27,8 +27,8 @@ impl Server {
             state: TxnState::Local,
         });
 
-        self.ack_lock(&msg);
-        self.async_consensus_write_lock(&msg);
+        self.ack_lock(&msg)?;
+        self.async_consensus_write_lock(&msg)?;
 
         Ok(())
     }
@@ -48,17 +48,15 @@ impl Server {
         }
     }
 
-    fn ack_lock(&self, msg: &transport::LockRequest) {
+    fn ack_lock(&self, msg: &transport::LockRequest) -> Result<(), String> {
         let msg = msg.ack();
-        // TODO handle closed channel by shutting down
-        self.transport.send(Box::new(msg)).unwrap();
+        self.transport.send(Box::new(msg)).map_err(|e| e.to_string())
     }
 
-    fn async_consensus_write_lock(&self, msg: &transport::LockRequest) {
+    fn async_consensus_write_lock(&self, msg: &transport::LockRequest) -> Result<(), String> {
         // TODO wait here (or actually model the replicas)
         let msg = msg.response(true);
-        // TODO handle closed channel by shutting down
-        self.transport.send(Box::new(msg)).unwrap();
+        self.transport.send(Box::new(msg)).map_err(|e| e.to_string())
     }
 }
 
