@@ -58,6 +58,14 @@ pub trait Receiver: Send + Sync {
     fn recv_msg(&self, msg: Box<dyn any::Any + Send>) -> Result<(), String>;
 }
 
+pub trait MsgRequest {
+    type Response: Send + 'static;
+    type Ack: Send + 'static;
+
+    fn ack(&self) -> Self::Ack;
+    fn response(&self, success: bool) -> Self::Response;
+}
+
 #[derive(Debug, Clone)]
 pub struct LockRequest {
     pub key: Key,
@@ -65,15 +73,18 @@ pub struct LockRequest {
     pub for_update_ts: Ts,
 }
 
-impl LockRequest {
-    pub fn ack(&self) -> LockAck {
+impl MsgRequest for LockRequest {
+    type Response = LockResponse;
+    type Ack = LockAck;
+
+    fn ack(&self) -> LockAck {
         LockAck {
             key: self.key,
             start_ts: self.start_ts,
         }
     }
 
-    pub fn response(&self, success: bool) -> LockResponse {
+    fn response(&self, success: bool) -> LockResponse {
         LockResponse {
             key: self.key,
             start_ts: self.start_ts,
@@ -101,6 +112,24 @@ pub struct PrewriteRequest {
     pub start_ts: Ts,
     pub commit_ts: Ts,
     pub writes: Vec<(Key, Value)>,
+}
+
+impl MsgRequest for PrewriteRequest {
+    type Response = PrewriteResponse;
+    type Ack = PrewriteAck;
+
+    fn ack(&self) -> PrewriteAck {
+        PrewriteAck {
+            start_ts: self.start_ts,
+        }
+    }
+
+    fn response(&self, success: bool) -> PrewriteResponse {
+        PrewriteResponse {
+            start_ts: self.start_ts,
+            success,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

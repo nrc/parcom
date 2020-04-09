@@ -73,6 +73,10 @@ impl transport::Receiver for Client {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
+        let msg = match msg.downcast::<transport::PrewriteResponse>() {
+            Ok(_) => return Ok(()),
+            Err(msg) => msg,
+        };
         Err(format!("Unknown message type: {:?}", msg.type_id()))
     }
 }

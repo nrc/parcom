@@ -7,6 +7,7 @@
 // non-locking reads
 // multiple clients and servers
 // deadlock
+// consensus write after failure
 //
 // Constraints
 //

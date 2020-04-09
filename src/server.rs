@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{transport::MsgRequest, *};
 use rand::{self, Rng};
 use std::{
     any,
@@ -54,28 +54,50 @@ impl Server {
         }
     }
 
+    // Precondition: key must be latched.
+    fn aquire_lock(&self, key: Key, start_ts: Ts) -> &mut Record {
+        let record = self.record(key);
+        // TODO check if already locked
+        record.lock = Some(Lock {
+            start_ts,
+            state: TxnState::Local,
+        });
+
+        record
+    }
+
     fn handle_lock(&self, msg: Box<transport::LockRequest>) -> Result<(), String> {
         let _latch = Latch::block_on_latch(&self.latches, msg.key);
 
         {
+            // TODO record writes or locks or both?
             let txn_record = self.txn_record(msg.start_ts);
             txn_record.keys.insert(msg.key, TxnState::Local);
 
-            let record = self.record(msg.key);
-            record.lock = Some(Lock {
-                start_ts: msg.start_ts,
-                state: TxnState::Local,
-            });
+            self.aquire_lock(msg.key, msg.start_ts);
         }
 
-        self.ack_lock(&msg)?;
-        self.async_consensus_write_lock(&msg)?;
+        self.ack(&*msg)?;
+        self.async_consensus_write_lock(&*msg)?;
 
         Ok(())
     }
 
     fn handle_prewrite(&self, msg: Box<transport::PrewriteRequest>) -> Result<(), String> {
-        // TODO
+        let txn_record = self.txn_record(msg.start_ts);
+        for &(k, v) in &msg.writes {
+            let _latch = Latch::block_on_latch(&self.latches, k);
+            txn_record.keys.insert(k, TxnState::Local);
+
+            let record = self.aquire_lock(k, msg.start_ts);
+            record.values.insert(msg.start_ts, v);
+        }
+
+        txn_record.commit_ts = Some(msg.commit_ts);
+
+        self.ack(&*msg)?;
+        self.async_consensus_write_prewrite(&msg)?;
+
         Ok(())
     }
 
@@ -94,36 +116,64 @@ impl Server {
         }
     }
 
-    fn ack_lock(&self, msg: &transport::LockRequest) -> Result<(), String> {
+    fn ack<T: MsgRequest>(&self, msg: &T) -> Result<(), String> {
         let msg = msg.ack();
         self.transport
             .send(Box::new(msg))
             .map_err(|e| e.to_string())
     }
 
-    fn async_consensus_write_lock(&self, msg: &transport::LockRequest) -> Result<(), String> {
-        // FIXME actually model the replicas
+    fn respond<T: MsgRequest>(&self, msg: &T) -> Result<(), String> {
+        let msg = msg.response(true);
+        self.transport
+            .send(Box::new(msg))
+            .map_err(|e| e.to_string())
+    }
 
+    fn wait_for_consensus() {
+        // FIXME actually model the replicas
         let wait_time = rand::thread_rng().gen_range(MIN_CONSENSUS_TIME, MAX_CONSENSUS_TIME);
         thread::sleep(Duration::from_millis(wait_time));
+    }
 
-        let record = self.record(msg.key);
+    fn update_lock_state(&self, key: Key, txn_record: &mut TxnRecord) {
+        let _latch = Latch::block_on_latch(&self.latches, key);
+        let record = self.record(key);
         match &mut record.lock {
             Some(lock) => lock.state = TxnState::Consensus,
             None => panic!("Expected lock, found none"),
         }
 
-        let txn_record = self.txn_record(msg.start_ts);
-        match txn_record.keys.get_mut(&msg.key) {
+        match txn_record.keys.get_mut(&key) {
             Some(key) => *key = TxnState::Consensus,
             None => panic!("Expected key, found none"),
         }
+    }
+
+    fn async_consensus_write_lock(&self, msg: &transport::LockRequest) -> Result<(), String> {
+        Server::wait_for_consensus();
+
+        let txn_record = self.txn_record(msg.start_ts);
+        self.update_lock_state(msg.key, txn_record);
+
         // We could check all keys and set the record lock state.
 
-        let msg = msg.response(true);
-        self.transport
-            .send(Box::new(msg))
-            .map_err(|e| e.to_string())
+        self.respond(msg)
+    }
+
+    fn async_consensus_write_prewrite(
+        &self,
+        msg: &transport::PrewriteRequest,
+    ) -> Result<(), String> {
+        // Assumes we do one consensus write for all writes in the transaction.
+        Server::wait_for_consensus();
+
+        let txn_record = self.txn_record(msg.start_ts);
+        for &(k, _) in &msg.writes {
+            self.update_lock_state(k, txn_record);
+        }
+
+        self.respond(msg)
     }
 }
 
@@ -171,6 +221,7 @@ struct Record {
 struct TxnRecord {
     keys: HashMap<Key, TxnState>,
     commit_state: TxnState,
+    commit_ts: Option<Ts>,
     start_ts: Ts,
 }
 
@@ -179,6 +230,7 @@ impl TxnRecord {
         TxnRecord {
             keys: HashMap::new(),
             commit_state: TxnState::Local,
+            commit_ts: None,
             start_ts,
         }
     }
