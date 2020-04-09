@@ -35,7 +35,9 @@ impl Client {
             start_ts,
             for_update_ts: self.tso.ts(),
         };
-        self.transport.send(Box::new(msg)).map_err(|e| e.to_string())
+        self.transport
+            .send(Box::new(msg))
+            .map_err(|e| e.to_string())
     }
 
     fn exec_prewrite(&self, start_ts: Ts) -> Result<(), String> {
@@ -47,7 +49,9 @@ impl Client {
             commit_ts: self.tso.ts(),
             writes,
         };
-        self.transport.send(Box::new(msg)).map_err(|e| e.to_string())
+        self.transport
+            .send(Box::new(msg))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -55,11 +59,17 @@ unsafe impl Sync for Client {}
 
 impl transport::Receiver for Client {
     fn recv_msg(&self, msg: Box<dyn any::Any + Send>) -> Result<(), String> {
+        // Ignore ACKs
         let msg = match msg.downcast::<transport::LockAck>() {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
         let msg = match msg.downcast::<transport::PrewriteAck>() {
+            Ok(_) => return Ok(()),
+            Err(msg) => msg,
+        };
+        // TODO
+        let msg = match msg.downcast::<transport::LockResponse>() {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };

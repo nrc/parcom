@@ -39,17 +39,18 @@ impl<T: Receiver + 'static> TransportRecv<T> {
         self.recv = Some(t);
     }
 
-    pub fn listen(self) {
+    pub fn listen(self) -> thread::JoinHandle<()> {
         thread::spawn(move || loop {
-            if let Err(_) = self
+            if let Err(e) = self
                 .channel
                 .recv()
                 .map_err(|e| e.to_string())
                 .and_then(|msg| self.recv.as_ref().unwrap().recv_msg(msg))
             {
+                eprintln!("listener shutting down: {}", e);
                 return;
             }
-        });
+        })
     }
 }
 

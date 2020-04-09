@@ -3,10 +3,10 @@
 // record state changes in Txn
 // timeouts
 // commit and tidy up
-// server replies
 // recovery
-// reads
+// non-locking reads
 // multiple clients and servers
+// deadlock
 //
 // Constraints
 //
@@ -29,6 +29,8 @@ const READS_PER_TXN: usize = 10;
 const WRITES_PER_TXN: usize = 10;
 const TXNS: usize = 100;
 const MAX_KEY: u64 = 1000;
+const MIN_CONSENSUS_TIME: u64 = 100;
+const MAX_CONSENSUS_TIME: u64 = 1000;
 
 #[derive(Debug, Clone)]
 pub struct Tso {
@@ -65,12 +67,15 @@ pub fn start() {
     let client = Arc::new(client::Client::new(tso.clone(), send2));
     recv1.set_handler(client.clone());
     recv2.set_handler(server.clone());
-    recv1.listen();
-    recv2.listen();
+    let j1 = recv1.listen();
+    let j2 = recv2.listen();
 
     for _ in 0..TXNS {
         if let Err(_) = client.exec_txn() {
             return;
         }
     }
+
+    j2.join().unwrap();
+    j1.join().unwrap();
 }
