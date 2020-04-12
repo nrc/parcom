@@ -25,6 +25,7 @@
 use std::sync::{Arc, Mutex};
 
 mod client;
+mod messages;
 mod server;
 mod transport;
 

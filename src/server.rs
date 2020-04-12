@@ -1,4 +1,4 @@
-use crate::{transport::MsgRequest, *};
+use crate::{messages::MsgRequest, *};
 use rand::{self, Rng};
 use std::{
     any,
@@ -86,7 +86,7 @@ impl Server {
         }
     }
 
-    fn handle_lock(&self, msg: Box<transport::LockRequest>) -> Result<(), String> {
+    fn handle_lock(&self, msg: Box<messages::LockRequest>) -> Result<(), String> {
         {
             // TODO record writes or locks or both?
             let txn_record = self.txn_record(msg.start_ts);
@@ -107,7 +107,7 @@ impl Server {
         Ok(())
     }
 
-    fn handle_prewrite(&self, msg: Box<transport::PrewriteRequest>) -> Result<(), String> {
+    fn handle_prewrite(&self, msg: Box<messages::PrewriteRequest>) -> Result<(), String> {
         let txn_record = self.txn_record(msg.start_ts);
         for &(k, v) in &msg.writes {
             if txn_record.keys.contains_key(&k) {
@@ -120,7 +120,6 @@ impl Server {
                 self.aquire_lock_and_set_value(k, msg.start_ts, Some(v));
                 txn_record.keys.insert(k, TxnState::Local);
             }
-
         }
 
         txn_record.commit_ts = Some(msg.commit_ts);
@@ -131,7 +130,7 @@ impl Server {
         Ok(())
     }
 
-    fn handle_finalise(&self, msg: Box<transport::FinaliseRequest>) -> Result<(), String> {
+    fn handle_finalise(&self, msg: Box<messages::FinaliseRequest>) -> Result<(), String> {
         self.finalise_txn(msg.start_ts)
     }
 
@@ -155,14 +154,7 @@ impl Server {
     }
 
     fn remove_txn_record(&self, start_ts: Ts) -> TxnRecord {
-        unsafe {
-            self.txns
-                .get()
-                .as_mut()
-                .unwrap()
-                .remove(&start_ts)
-                .unwrap()
-        }
+        unsafe { self.txns.get().as_mut().unwrap().remove(&start_ts).unwrap() }
     }
 
     fn ack<T: MsgRequest>(&self, msg: &T) -> Result<(), String> {
@@ -199,7 +191,7 @@ impl Server {
         }
     }
 
-    fn async_consensus_write_lock(&self, msg: &transport::LockRequest) -> Result<(), String> {
+    fn async_consensus_write_lock(&self, msg: &messages::LockRequest) -> Result<(), String> {
         Server::wait_for_consensus();
 
         let txn_record = self.txn_record(msg.start_ts);
@@ -212,7 +204,7 @@ impl Server {
 
     fn async_consensus_write_prewrite(
         &self,
-        msg: &transport::PrewriteRequest,
+        msg: &messages::PrewriteRequest,
     ) -> Result<(), String> {
         // Assumes we do one consensus write for all writes in the transaction.
         Server::wait_for_consensus();
@@ -240,7 +232,9 @@ impl Server {
                 // FIXME us thus always true?
                 assert!(record.writes.last().unwrap().0 > txn_record.commit_ts.unwrap());
             }
-            record.writes.push((txn_record.commit_ts.unwrap(), start_ts));
+            record
+                .writes
+                .push((txn_record.commit_ts.unwrap(), start_ts));
         });
 
         // Remove the txn record to conclude the transaction.

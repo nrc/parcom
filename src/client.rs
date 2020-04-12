@@ -35,7 +35,7 @@ impl Client {
     fn exec_lock(&self, start_ts: Ts) -> Result<(), String> {
         let key = random_key();
         // eprintln!("lock {:?}", key);
-        let msg = transport::LockRequest {
+        let msg = messages::LockRequest {
             key,
             start_ts,
             for_update_ts: self.tso.ts(),
@@ -50,7 +50,7 @@ impl Client {
             .map(|_| (random_key(), random_value()))
             .collect();
         // eprintln!("write {:?}", writes);
-        let msg = transport::PrewriteRequest {
+        let msg = messages::PrewriteRequest {
             start_ts,
             commit_ts: self.tso.ts(),
             writes,
@@ -60,7 +60,7 @@ impl Client {
             .map_err(|e| e.to_string())
     }
 
-    fn handle_prewrite_response(&self, msg: Box<transport::PrewriteResponse>) -> Result<(), String> {
+    fn handle_prewrite_response(&self, msg: Box<messages::PrewriteResponse>) -> Result<(), String> {
         // TODO add to list of responses
         // TODO retry if no success
         assert!(msg.success);
@@ -70,9 +70,7 @@ impl Client {
 
     fn check_responses_and_commit(&self, start_ts: Ts) -> Result<(), String> {
         // TODO count responses, only send if all ticked off.
-        let msg = transport::FinaliseRequest {
-            start_ts,
-        };
+        let msg = messages::FinaliseRequest { start_ts };
         self.transport
             .send(Box::new(msg))
             .map_err(|e| e.to_string())
@@ -86,20 +84,20 @@ impl transport::Receiver for Client {
         // We don't need to spawn a thread here because none of these operations can block.
 
         // Ignore ACKs for now.
-        let msg = match msg.downcast::<transport::LockAck>() {
+        let msg = match msg.downcast::<messages::LockAck>() {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
-        let msg = match msg.downcast::<transport::PrewriteAck>() {
+        let msg = match msg.downcast::<messages::PrewriteAck>() {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
         // TODO record the response
-        let msg = match msg.downcast::<transport::LockResponse>() {
+        let msg = match msg.downcast::<messages::LockResponse>() {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
-        let msg = match msg.downcast::<transport::PrewriteResponse>() {
+        let msg = match msg.downcast() {
             Ok(msg) => return self.handle_prewrite_response(msg),
             Err(msg) => msg,
         };
