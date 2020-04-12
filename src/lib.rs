@@ -20,6 +20,8 @@
 //
 // What if a lock message is lost? Is it checked at prewrite?
 
+#![feature(never_type)]
+
 use std::sync::{Arc, Mutex};
 
 mod client;
@@ -55,7 +57,7 @@ impl Tso {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Key(u64);
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct Ts(u64);
 #[derive(Debug, Copy, Clone, Default)]
 pub struct Value(u64);

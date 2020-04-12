@@ -143,3 +143,23 @@ pub struct PrewriteResponse {
     // FIXME needs more detail if we want to retry
     pub success: bool,
 }
+
+
+#[derive(Debug, Clone)]
+pub struct FinaliseRequest {
+    pub start_ts: Ts,
+}
+
+
+impl MsgRequest for FinaliseRequest {
+    type Response = !;
+    type Ack = !;
+
+    fn ack(&self) -> ! {
+        panic!();
+    }
+
+    fn response(&self, _: bool) -> ! {
+        panic!();
+    }
+}

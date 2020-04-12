@@ -53,6 +53,24 @@ impl Client {
             .send(Box::new(msg))
             .map_err(|e| e.to_string())
     }
+
+    fn handle_prewrite_response(&self, msg: Box<transport::PrewriteResponse>) -> Result<(), String> {
+        // TODO add to list of responses
+        // TODO retry if no success
+        assert!(msg.success);
+        self.check_responses_and_commit(msg.start_ts)?;
+        Ok(())
+    }
+
+    fn check_responses_and_commit(&self, start_ts: Ts) -> Result<(), String> {
+        // TODO count responses, only send if all ticked off.
+        let msg = transport::FinaliseRequest {
+            start_ts,
+        };
+        self.transport
+            .send(Box::new(msg))
+            .map_err(|e| e.to_string())
+    }
 }
 
 unsafe impl Sync for Client {}
@@ -68,13 +86,13 @@ impl transport::Receiver for Client {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
-        // TODO
+        // TODO record the response
         let msg = match msg.downcast::<transport::LockResponse>() {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
         let msg = match msg.downcast::<transport::PrewriteResponse>() {
-            Ok(_) => return Ok(()),
+            Ok(msg) => return self.handle_prewrite_response(msg),
             Err(msg) => msg,
         };
         Err(format!("Unknown message type: {:?}", msg.type_id()))

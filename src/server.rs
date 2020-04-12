@@ -57,7 +57,7 @@ impl Server {
     // Precondition: key must be latched.
     fn aquire_lock(&self, key: Key, start_ts: Ts) -> &mut Record {
         let record = self.record(key);
-        // TODO check if already locked
+        assert!(record.lock.is_none());
         record.lock = Some(Lock {
             start_ts,
             state: TxnState::Local,
@@ -101,8 +101,16 @@ impl Server {
         Ok(())
     }
 
+    fn handle_finalise(&self, msg: Box<transport::FinaliseRequest>) -> Result<(), String> {
+        self.finalise_txn(msg.start_ts)
+    }
+
     fn record(&self, key: Key) -> &mut Record {
         unsafe { self.keys.get().as_mut().unwrap().entry(key).or_default() }
+    }
+
+    fn assert_record(&self, key: Key) -> &mut Record {
+        unsafe { self.keys.get().as_mut().unwrap().get_mut(&key).unwrap() }
     }
 
     fn txn_record(&self, start_ts: Ts) -> &mut TxnRecord {
@@ -113,6 +121,17 @@ impl Server {
                 .unwrap()
                 .entry(start_ts)
                 .or_insert_with(|| TxnRecord::new(start_ts))
+        }
+    }
+
+    fn remove_txn_record(&self, start_ts: Ts) -> TxnRecord {
+        unsafe {
+            self.txns
+                .get()
+                .as_mut()
+                .unwrap()
+                .remove(&start_ts)
+                .unwrap()
         }
     }
 
@@ -175,6 +194,29 @@ impl Server {
 
         self.respond(msg)
     }
+
+    fn finalise_txn(&self, start_ts: Ts) -> Result<(), String> {
+        // TODO rather than remove, we should borrow, write the commit state, do our thing, then remove
+        let txn_record = self.remove_txn_record(start_ts);
+        assert!(txn_record.commit_state == TxnState::Local);
+
+        // Commit each key write, remove the lock.
+        txn_record.keys.iter().for_each(|(&k, &s)| {
+            assert!(s == TxnState::Consensus);
+            Latch::block_on_latch(&self.latches, k);
+            let record = self.assert_record(k);
+            record.lock = None;
+            if !record.writes.is_empty() {
+                // FIXME us thus always true?
+                assert!(record.writes.last().unwrap().0 > txn_record.commit_ts.unwrap());
+            }
+            record.writes.push((txn_record.commit_ts.unwrap(), start_ts));
+        });
+
+        // Remove the txn record to conclude the transaction.
+
+        Ok(())
+    }
 }
 
 impl Drop for Server {
@@ -205,6 +247,10 @@ impl transport::Receiver for Server {
             Ok(msg) => return self.handle_prewrite(msg),
             Err(msg) => msg,
         };
+        let msg = match msg.downcast() {
+            Ok(msg) => return self.handle_finalise(msg),
+            Err(msg) => msg,
+        };
         Err(format!("Unknown message type: {:?}", msg.type_id()))
     }
 }
@@ -214,6 +260,8 @@ struct Cluster {}
 #[derive(Debug, Default, Clone)]
 struct Record {
     values: HashMap<Ts, Value>,
+    // commit ts, start ts; ordered by commit ts, descending.
+    writes: Vec<(Ts, Ts)>,
     lock: Option<Lock>,
 }
 
@@ -242,7 +290,7 @@ struct Lock {
     state: TxnState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TxnState {
     Local,
     Consensus,
