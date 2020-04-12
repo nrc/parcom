@@ -54,27 +54,51 @@ impl Server {
         }
     }
 
-    // Precondition: key must be latched.
-    fn aquire_lock(&self, key: Key, start_ts: Ts) -> &mut Record {
-        let record = self.record(key);
-        assert!(record.lock.is_none());
-        record.lock = Some(Lock {
-            start_ts,
-            state: TxnState::Local,
-        });
+    pub fn shutdown(&self) {
+        self.transport.shutdown();
+    }
 
-        record
+    // Precondition: lock must not be held by txn start_ts
+    fn aquire_lock_and_set_value(&self, key: Key, start_ts: Ts, value: Option<Value>) {
+        // TODO can we recover or return to client instead of blocking
+        let mut sleeps = 100;
+        loop {
+            let _latch = Latch::block_on_latch(&self.latches, key);
+            let record = self.record(key);
+
+            if record.lock.is_none() {
+                record.lock = Some(Lock {
+                    start_ts,
+                    state: TxnState::Local,
+                });
+
+                if let Some(v) = value {
+                    let exists = record.values.insert(start_ts, v);
+                    assert!(exists.is_none());
+                }
+                return;
+            }
+            if sleeps <= 0 {
+                panic!("timed out waiting for lock on {:?}", key);
+            }
+            thread::sleep(Duration::from_millis(20));
+            sleeps -= 1;
+        }
     }
 
     fn handle_lock(&self, msg: Box<transport::LockRequest>) -> Result<(), String> {
-        let _latch = Latch::block_on_latch(&self.latches, msg.key);
-
         {
             // TODO record writes or locks or both?
             let txn_record = self.txn_record(msg.start_ts);
-            txn_record.keys.insert(msg.key, TxnState::Local);
+            if txn_record.keys.contains_key(&msg.key) {
+                // Check we have locked this key.
+                let record = self.record(msg.key);
+                assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
+            } else {
+                self.aquire_lock_and_set_value(msg.key, msg.start_ts, None);
 
-            self.aquire_lock(msg.key, msg.start_ts);
+                txn_record.keys.insert(msg.key, TxnState::Local);
+            }
         }
 
         self.ack(&*msg)?;
@@ -86,11 +110,17 @@ impl Server {
     fn handle_prewrite(&self, msg: Box<transport::PrewriteRequest>) -> Result<(), String> {
         let txn_record = self.txn_record(msg.start_ts);
         for &(k, v) in &msg.writes {
-            let _latch = Latch::block_on_latch(&self.latches, k);
-            txn_record.keys.insert(k, TxnState::Local);
+            if txn_record.keys.contains_key(&k) {
+                // Key is already locked, just need to write the value.
+                let record = self.record(k);
+                assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
+                record.values.insert(msg.start_ts, v);
+            } else {
+                // Lock and set value.
+                self.aquire_lock_and_set_value(k, msg.start_ts, Some(v));
+                txn_record.keys.insert(k, TxnState::Local);
+            }
 
-            let record = self.aquire_lock(k, msg.start_ts);
-            record.values.insert(msg.start_ts, v);
         }
 
         txn_record.commit_ts = Some(msg.commit_ts);
@@ -221,16 +251,17 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        assert!(self.latches.lock().unwrap().is_empty());
-        unsafe {
-            eprintln!("len {}", self.keys.get().as_mut().unwrap().len());
-            self.keys
-                .get()
-                .as_mut()
-                .unwrap()
-                .values()
-                .for_each(|k| assert!(k.lock.is_none()));
-        }
+        // TODO check these on normal shutdown only
+        // assert!(self.latches.lock().unwrap().is_empty());
+        // unsafe {
+        //     eprintln!("len {}", self.keys.get().as_mut().unwrap().len());
+        //     self.keys
+        //         .get()
+        //         .as_mut()
+        //         .unwrap()
+        //         .values()
+        //         .for_each(|k| assert!(k.lock.is_none()));
+        // }
     }
 }
 

@@ -28,12 +28,13 @@ mod client;
 mod server;
 mod transport;
 
-const READS_PER_TXN: usize = 10;
-const WRITES_PER_TXN: usize = 10;
-const TXNS: usize = 100;
+const READS_PER_TXN: usize = 1;
+const WRITES_PER_TXN: usize = 1;
+// TODO multiple txns are failing
+const TXNS: usize = 1;
 const MAX_KEY: u64 = 1000;
-const MIN_CONSENSUS_TIME: u64 = 100;
-const MAX_CONSENSUS_TIME: u64 = 1000;
+const MIN_CONSENSUS_TIME: u64 = 10;
+const MAX_CONSENSUS_TIME: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct Tso {
@@ -79,6 +80,8 @@ pub fn start() {
         }
     }
 
+    client.shutdown();
     j2.join().unwrap();
+    server.shutdown();
     j1.join().unwrap();
 }

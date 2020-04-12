@@ -17,6 +17,10 @@ impl Client {
         }
     }
 
+    pub fn shutdown(&self) {
+        self.transport.shutdown();
+    }
+
     pub fn exec_txn(&self) -> Result<(), String> {
         let start_ts = self.tso.ts();
         self.txns.lock().unwrap().insert(start_ts, Txn {});
@@ -30,6 +34,7 @@ impl Client {
 
     fn exec_lock(&self, start_ts: Ts) -> Result<(), String> {
         let key = random_key();
+        // eprintln!("lock {:?}", key);
         let msg = transport::LockRequest {
             key,
             start_ts,
@@ -44,6 +49,7 @@ impl Client {
         let writes = (0..WRITES_PER_TXN)
             .map(|_| (random_key(), random_value()))
             .collect();
+        // eprintln!("write {:?}", writes);
         let msg = transport::PrewriteRequest {
             start_ts,
             commit_ts: self.tso.ts(),
@@ -77,7 +83,9 @@ unsafe impl Sync for Client {}
 
 impl transport::Receiver for Client {
     fn recv_msg(&self, msg: Box<dyn any::Any + Send>) -> Result<(), String> {
-        // Ignore ACKs
+        // We don't need to spawn a thread here because none of these operations can block.
+
+        // Ignore ACKs for now.
         let msg = match msg.downcast::<transport::LockAck>() {
             Ok(_) => return Ok(()),
             Err(msg) => msg,

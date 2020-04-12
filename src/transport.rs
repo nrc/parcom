@@ -32,6 +32,13 @@ impl TransportSend {
             .send(msg)
             .map_err(|e| format!("Sending message failed: {}", e))
     }
+
+    pub fn shutdown(&self) {
+        self.channel
+            .send(Box::new(Shutdown))
+            .map_err(|e| format!("Sending shutdown message failed: {}", e))
+            .unwrap();
+    }
 }
 
 impl<T: Receiver + 'static> TransportRecv<T> {
@@ -41,11 +48,17 @@ impl<T: Receiver + 'static> TransportRecv<T> {
 
     pub fn listen(self) -> thread::JoinHandle<()> {
         thread::spawn(move || loop {
-            if let Err(e) = self
+            let msg = self
                 .channel
                 .recv()
-                .map_err(|e| e.to_string())
-                .and_then(|msg| self.recv.as_ref().unwrap().recv_msg(msg))
+                .map_err(|e| e.to_string());
+            if let Ok(msg) = &msg {
+                if msg.is::<Shutdown>() {
+                    eprintln!("listener shutting down normally");
+                    return;
+                }
+            }
+            if let Err(e) = msg.and_then(|msg| self.recv.as_ref().unwrap().recv_msg(msg))
             {
                 eprintln!("listener shutting down: {}", e);
                 return;
@@ -144,14 +157,28 @@ pub struct PrewriteResponse {
     pub success: bool,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct FinaliseRequest {
     pub start_ts: Ts,
 }
 
-
 impl MsgRequest for FinaliseRequest {
+    type Response = !;
+    type Ack = !;
+
+    fn ack(&self) -> ! {
+        panic!();
+    }
+
+    fn response(&self, _: bool) -> ! {
+        panic!();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Shutdown;
+
+impl MsgRequest for Shutdown {
     type Response = !;
     type Ack = !;
 
