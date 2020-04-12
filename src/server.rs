@@ -9,6 +9,8 @@ use std::{
 };
 
 pub struct Server {
+    // We use txn records indexed by start TS, rather than storing this info on the primary lock.
+    // The two approaches are equivalent.
     txns: UnsafeCell<HashMap<Ts, TxnRecord>>,
     keys: UnsafeCell<HashMap<Key, Record>>,
     latches: Mutex<HashSet<Key>>,
@@ -229,9 +231,10 @@ impl Server {
             let record = self.assert_record(k);
             record.lock = None;
             if !record.writes.is_empty() {
-                // FIXME us thus always true?
+                // FIXME is thus always true?
                 assert!(record.writes.last().unwrap().0 > txn_record.commit_ts.unwrap());
             }
+            // TODO don't write if we only locked for a read
             record
                 .writes
                 .push((txn_record.commit_ts.unwrap(), start_ts));

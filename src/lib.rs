@@ -8,17 +8,7 @@
 // multiple clients and servers
 // deadlock
 // consensus write after failure
-//
-// Constraints
-//
-// first key locked must be the primary key.
-// in TiKV we'd store the txn record as part of the primary lock.
-// all reads are locking reads
-// point access only
-//
-// Questions
-//
-// What if a lock message is lost? Is it checked at prewrite?
+// for_update_ts
 
 #![feature(never_type)]
 
