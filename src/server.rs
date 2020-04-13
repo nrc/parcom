@@ -4,8 +4,10 @@ use std::{
     any,
     cell::UnsafeCell,
     collections::{HashMap, HashSet},
-    hash::Hash,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -13,41 +15,12 @@ use std::{
 pub struct Server {
     // We use txn records indexed by start TS, rather than storing this info on the primary lock.
     // The two approaches are equivalent.
-    txns: UnsafeCell<HashMap<Ts, TxnRecord>>,
-    keys: UnsafeCell<HashMap<Key, Record>>,
+    txns: UnsafeCell<HashMap<Ts, Box<TxnRecord>>>,
+    keys: UnsafeCell<HashMap<Key, Box<Record>>>,
     latches: Mutex<HashSet<Key>>,
     txn_latches: Mutex<HashSet<Ts>>,
     transport: transport::TransportSend,
     thread_count: AtomicU64,
-}
-
-struct Latch<'a, T: Eq + Hash> {
-    key: T,
-    latches: &'a Mutex<HashSet<T>>,
-}
-
-impl<'a, T: Copy + Eq + Hash> Latch<'a, T> {
-    fn block_on_latch(latches: &'a Mutex<HashSet<T>>, key: T) -> Latch<'a, T> {
-        loop {
-            {
-                let mut latches = latches.lock().unwrap();
-                if !latches.contains(&key) {
-                    latches.insert(key);
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        Latch { key, latches }
-    }
-}
-
-impl<'a, T: Eq + Hash> Drop for Latch<'a, T> {
-    fn drop(&mut self) {
-        let mut latches = self.latches.lock().unwrap();
-        latches.remove(&self.key);
-    }
 }
 
 impl Server {
@@ -78,8 +51,7 @@ impl Server {
     }
 
     fn handle_lock(&self, msg: Box<messages::LockRequest>) -> Result<(), String> {
-        eprintln!("lock {:?}", msg.start_ts);
-        eprintln!("lock key {:?}", msg.key);
+        eprintln!("lock {:?} {:?}", msg.key, msg.start_ts);
         {
             // TODO record writes or locks or both?
             let (_latch, txn_record) = self.txn_record(msg.start_ts);
@@ -89,23 +61,22 @@ impl Server {
                 assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
             } else {
                 self.aquire_lock_and_set_value(msg.key, msg.start_ts, None);
-
                 txn_record.keys.insert(msg.key, TxnState::Local);
             }
         }
 
         self.ack(&*msg)?;
-        self.async_consensus_write_lock(&*msg)?;
+        self.async_consensus_write_lock(&msg)?;
 
         Ok(())
     }
 
     fn handle_prewrite(&self, msg: Box<messages::PrewriteRequest>) -> Result<(), String> {
-        eprintln!("prewrite {:?}", msg.start_ts);
+        eprintln!("prewrite {:?} {:?}", msg.start_ts, msg.writes);
         {
             let (_latch, txn_record) = self.txn_record(msg.start_ts);
             for &(k, v) in &msg.writes {
-                eprintln!("prewrite key {:?}", k);
+                eprintln!("prewrite key {:?} {:?}", msg.start_ts, k);
                 if txn_record.keys.contains_key(&k) {
                     // Key is already locked, just need to write the value.
                     let record = self.record(k);
@@ -137,7 +108,7 @@ impl Server {
         // TODO can we recover or return to client instead of blocking
         let mut sleeps = 100;
         loop {
-            let _latch = Latch::block_on_latch(&self.latches, key);
+            let _latch = latch::block_on_latch(&self.latches, key);
             let record = self.record(key);
 
             if record.lock.is_none() {
@@ -165,11 +136,11 @@ impl Server {
     }
 
     fn assert_record(&self, key: Key) -> &mut Record {
-        unsafe { self.keys.get().as_mut().unwrap().get_mut(&key).unwrap() }
+        unsafe { self.keys.get().as_mut().expect(&format!("assert_record failed {:?}", key)).get_mut(&key).unwrap() }
     }
 
-    fn txn_record<'a>(&'a self, start_ts: Ts) -> (Latch<'a, Ts>, &mut TxnRecord) {
-        let latch = Latch::block_on_latch(&self.txn_latches, start_ts);
+    fn txn_record<'a>(&'a self, start_ts: Ts) -> (latch::Latch<'a, Ts>, &mut TxnRecord) {
+        let latch = latch::block_on_latch(&self.txn_latches, start_ts);
 
         unsafe {
             (
@@ -184,8 +155,24 @@ impl Server {
         }
     }
 
-    fn remove_txn_record(&self, start_ts: Ts) -> TxnRecord {
-        let _latch = Latch::block_on_latch(&self.txn_latches, start_ts);
+    fn assert_txn_record<'a>(&'a self, start_ts: Ts) -> (latch::Latch<'a, Ts>, &mut TxnRecord) {
+        let latch = latch::block_on_latch(&self.txn_latches, start_ts);
+
+        unsafe {
+            (
+                latch,
+                self.txns
+                    .get()
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&start_ts)
+                    .expect(&format!("assert_txn_record failed {:?}", start_ts)),
+            )
+        }
+    }
+
+    fn remove_txn_record(&self, start_ts: Ts) -> Box<TxnRecord> {
+        let _latch = latch::block_on_latch(&self.txn_latches, start_ts);
         unsafe { self.txns.get().as_mut().unwrap().remove(&start_ts).unwrap() }
     }
 
@@ -210,11 +197,11 @@ impl Server {
     }
 
     fn update_lock_state(&self, key: Key, txn_record: &mut TxnRecord) {
-        let _latch = Latch::block_on_latch(&self.latches, key);
-        let record = self.record(key);
+        let _latch = latch::block_on_latch(&self.latches, key);
+        let record = self.assert_record(key);
         match &mut record.lock {
             Some(lock) => lock.state = TxnState::Consensus,
-            None => panic!("Expected lock (for key {:?}), found none", key),
+            None => panic!("Expected lock (for {:?}), found none", key),
         }
 
         match txn_record.keys.get_mut(&key) {
@@ -226,7 +213,7 @@ impl Server {
     fn async_consensus_write_lock(&self, msg: &messages::LockRequest) -> Result<(), String> {
         Server::wait_for_consensus();
 
-        let (_latch, txn_record) = self.txn_record(msg.start_ts);
+        let (_latch, txn_record) = self.assert_txn_record(msg.start_ts);
         self.update_lock_state(msg.key, txn_record);
         eprintln!("consensus lock complete {:?} {:?}", msg.start_ts, msg.key);
 
@@ -242,7 +229,7 @@ impl Server {
         // Assumes we do one consensus write for all writes in the transaction.
         Server::wait_for_consensus();
 
-        let (_latch, txn_record) = self.txn_record(msg.start_ts);
+        let (_latch, txn_record) = self.assert_txn_record(msg.start_ts);
         for &(k, _) in &msg.writes {
             self.update_lock_state(k, txn_record);
         }
@@ -267,7 +254,7 @@ impl Server {
                 k,
                 start_ts
             );
-            Latch::block_on_latch(&self.latches, k);
+            latch::block_on_latch(&self.latches, k);
             let record = self.assert_record(k);
             record.lock = None;
             if !record.writes.is_empty() {
@@ -361,13 +348,13 @@ struct TxnRecord {
 }
 
 impl TxnRecord {
-    fn new(start_ts: Ts) -> TxnRecord {
-        TxnRecord {
+    fn new(start_ts: Ts) -> Box<TxnRecord> {
+        Box::new(TxnRecord {
             keys: HashMap::new(),
             commit_state: TxnState::Local,
             commit_ts: None,
             start_ts,
-        }
+        })
     }
 }
 

@@ -1,9 +1,15 @@
 use crate::*;
 use rand::{self, Rng};
-use std::{any, collections::HashMap, sync::Mutex};
+use std::{
+    any,
+    cell::UnsafeCell,
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 pub struct Client {
-    txns: Mutex<HashMap<Ts, Txn>>,
+    txns: UnsafeCell<HashMap<Ts, Box<Txn>>>,
+    txn_latches: Mutex<HashSet<Ts>>,
     tso: Tso,
     transport: transport::TransportSend,
 }
@@ -11,7 +17,8 @@ pub struct Client {
 impl Client {
     pub fn new(tso: Tso, transport: transport::TransportSend) -> Client {
         Client {
-            txns: Mutex::new(HashMap::new()),
+            txns: UnsafeCell::new(HashMap::new()),
+            txn_latches: Mutex::new(HashSet::new()),
             tso,
             transport,
         }
@@ -23,16 +30,27 @@ impl Client {
 
     pub fn exec_txn(&self) -> Result<(), String> {
         let start_ts = self.tso.ts();
-        self.txns.lock().unwrap().insert(start_ts, Txn {});
-        for _ in 0..READS_PER_TXN {
-            self.exec_lock(start_ts)?;
+
+        {
+            let _latch = latch::block_on_latch(&self.txn_latches, start_ts);
+            let txn: &mut Txn = unsafe {
+                let txns = self.txns.get().as_mut().unwrap();
+                txns.insert(start_ts, Txn::new());
+                txns.get_mut(&start_ts).unwrap()
+            };
+
+            for _ in 0..READS_PER_TXN {
+                let key = self.exec_lock(start_ts)?;
+                txn.locks.push(key);
+            }
+            self.exec_prewrite(start_ts)?;
         }
-        self.exec_prewrite(start_ts)
         // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
         // TODO block waiting for responses.
+        Ok(())
     }
 
-    fn exec_lock(&self, start_ts: Ts) -> Result<(), String> {
+    fn exec_lock(&self, start_ts: Ts) -> Result<Key, String> {
         let key = random_key();
         // eprintln!("lock {:?}", key);
         let msg = messages::LockRequest {
@@ -43,6 +61,7 @@ impl Client {
         self.transport
             .send(Box::new(msg))
             .map_err(|e| e.to_string())
+            .map(|_| key)
     }
 
     fn exec_prewrite(&self, start_ts: Ts) -> Result<(), String> {
@@ -61,19 +80,47 @@ impl Client {
     }
 
     fn handle_prewrite_response(&self, msg: Box<messages::PrewriteResponse>) -> Result<(), String> {
-        // TODO add to list of responses
         // TODO retry if no success
         assert!(msg.success);
+        self.assert_txn(msg.start_ts).1.prewrite = true;
+        self.check_responses_and_commit(msg.start_ts)?;
+        Ok(())
+    }
+
+    fn handle_lock_response(&self, msg: Box<messages::LockResponse>) -> Result<(), String> {
+        // TODO retry if no success
+        assert!(msg.success);
+        self.assert_txn(msg.start_ts)
+            .1
+            .locks
+            .remove_item(&msg.key)
+            .unwrap();
         self.check_responses_and_commit(msg.start_ts)?;
         Ok(())
     }
 
     fn check_responses_and_commit(&self, start_ts: Ts) -> Result<(), String> {
-        // TODO count responses, only send if all ticked off.
+        if !self.assert_txn(start_ts).1.complete() {
+            return Ok(());
+        }
+
         let msg = messages::FinaliseRequest { start_ts };
         self.transport
             .send(Box::new(msg))
             .map_err(|e| e.to_string())
+    }
+
+    fn assert_txn<'a>(&'a self, start_ts: Ts) -> (latch::Latch<'a, Ts>, &mut Txn) {
+        let latch = latch::block_on_latch(&self.txn_latches, start_ts);
+        let txn = unsafe {
+            self.txns
+                .get()
+                .as_mut()
+                .unwrap()
+                .get_mut(&start_ts)
+                .unwrap()
+        };
+        (latch, txn)
     }
 }
 
@@ -92,9 +139,8 @@ impl transport::Receiver for Client {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
-        // TODO record the response
-        let msg = match msg.downcast::<messages::LockResponse>() {
-            Ok(_) => return Ok(()),
+        let msg = match msg.downcast() {
+            Ok(msg) => return self.handle_lock_response(msg),
             Err(msg) => msg,
         };
         let msg = match msg.downcast() {
@@ -117,4 +163,20 @@ fn random_value() -> Value {
     Value(rand::random())
 }
 
-struct Txn {}
+struct Txn {
+    locks: Vec<Key>,
+    prewrite: bool,
+}
+
+impl Txn {
+    fn new() -> Box<Txn> {
+        Box::new(Txn {
+            locks: Vec::new(),
+            prewrite: false,
+        })
+    }
+
+    fn complete(&self) -> bool {
+        self.prewrite && self.locks.is_empty()
+    }
+}

@@ -1,6 +1,5 @@
 // TODO
 //
-// record state changes in Txn
 // timeouts
 // non-locking reads (and the reading part of locking reads)
 // recovery
@@ -10,6 +9,7 @@
 // for_update_ts
 
 #![feature(never_type)]
+#![feature(vec_remove_item)]
 
 use std::{
     sync::{Arc, Mutex},
@@ -18,14 +18,14 @@ use std::{
 };
 
 mod client;
+mod latch;
 mod messages;
 mod server;
 mod transport;
 
-const READS_PER_TXN: usize = 1;
-const WRITES_PER_TXN: usize = 1;
-// TODO multiple txns are failing
-const TXNS: usize = 2;
+const READS_PER_TXN: usize = 10;
+const WRITES_PER_TXN: usize = 10;
+const TXNS: usize = 10;
 const MAX_KEY: u64 = 1000;
 const MIN_CONSENSUS_TIME: u64 = 10;
 const MAX_CONSENSUS_TIME: u64 = 100;
