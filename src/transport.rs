@@ -52,10 +52,11 @@ impl<T: Receiver + 'static> TransportRecv<T> {
             if let Ok(msg) = &msg {
                 if msg.is::<Shutdown>() {
                     eprintln!("listener shutting down normally");
+                    self.recv.clone().unwrap().handle_shutdown().unwrap();
                     return;
                 }
             }
-            if let Err(e) = msg.and_then(|msg| self.recv.as_ref().unwrap().recv_msg(msg)) {
+            if let Err(e) = msg.and_then(|msg| self.recv.clone().unwrap().recv_msg(msg)) {
                 eprintln!("listener shutting down: {}", e);
                 return;
             }
@@ -64,5 +65,6 @@ impl<T: Receiver + 'static> TransportRecv<T> {
 }
 
 pub trait Receiver: Send + Sync {
-    fn recv_msg(&self, msg: Box<dyn any::Any + Send>) -> Result<(), String>;
+    fn recv_msg(self: Arc<Self>, msg: Box<dyn any::Any + Send>) -> Result<(), String>;
+    fn handle_shutdown(self: Arc<Self>) -> Result<(), String>;
 }

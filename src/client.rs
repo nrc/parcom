@@ -80,7 +80,7 @@ impl Client {
 unsafe impl Sync for Client {}
 
 impl transport::Receiver for Client {
-    fn recv_msg(&self, msg: Box<dyn any::Any + Send>) -> Result<(), String> {
+    fn recv_msg(self: Arc<Self>, msg: Box<dyn any::Any + Send>) -> Result<(), String> {
         // We don't need to spawn a thread here because none of these operations can block.
 
         // Ignore ACKs for now.
@@ -102,6 +102,10 @@ impl transport::Receiver for Client {
             Err(msg) => msg,
         };
         Err(format!("Unknown message type: {:?}", msg.type_id()))
+    }
+
+    fn handle_shutdown(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
     }
 }
 

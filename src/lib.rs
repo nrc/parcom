@@ -2,9 +2,8 @@
 //
 // record state changes in Txn
 // timeouts
-// commit and tidy up
+// non-locking reads (and the reading part of locking reads)
 // recovery
-// non-locking reads
 // multiple clients and servers
 // deadlock
 // consensus write after failure
@@ -12,7 +11,11 @@
 
 #![feature(never_type)]
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 mod client;
 mod messages;
@@ -22,7 +25,7 @@ mod transport;
 const READS_PER_TXN: usize = 1;
 const WRITES_PER_TXN: usize = 1;
 // TODO multiple txns are failing
-const TXNS: usize = 1;
+const TXNS: usize = 2;
 const MAX_KEY: u64 = 1000;
 const MIN_CONSENSUS_TIME: u64 = 10;
 const MAX_CONSENSUS_TIME: u64 = 100;
@@ -70,6 +73,9 @@ pub fn start() {
             return;
         }
     }
+
+    // FIXME this is a hack, better to wait for all operations to complete before starting shutdown.
+    thread::sleep(Duration::from_millis(1000));
 
     client.shutdown();
     j2.join().unwrap();
