@@ -28,9 +28,13 @@ pub struct TransportRecv<T: Receiver> {
 
 impl TransportSend {
     pub fn send(&self, msg: Box<dyn any::Any + Send>) -> Result<(), String> {
-        self.channel
+        eprintln!("sending");
+        let result = self
+            .channel
             .send(msg)
-            .map_err(|e| format!("Sending message failed: {}", e))
+            .map_err(|e| format!("Sending message failed: {}", e));
+        eprintln!("sent");
+        result
     }
 
     pub fn shutdown(&self) {

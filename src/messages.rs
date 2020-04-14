@@ -105,6 +105,25 @@ impl MsgRequest for FinaliseRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct RollbackRequest {
+    pub start_ts: Ts,
+    pub keys: Vec<Key>,
+}
+
+impl MsgRequest for RollbackRequest {
+    type Response = !;
+    type Ack = !;
+
+    fn ack(&self) -> ! {
+        panic!();
+    }
+
+    fn response(&self, _: bool) -> ! {
+        panic!();
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Shutdown;
 
 impl MsgRequest for Shutdown {

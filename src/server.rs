@@ -4,6 +4,7 @@ use std::{
     any,
     cell::UnsafeCell,
     collections::{HashMap, HashSet},
+    fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -54,13 +55,16 @@ impl Server {
         eprintln!("lock {:?} {:?}", msg.key, msg.start_ts);
         {
             // TODO record writes or locks or both?
-            let (_latch, txn_record) = self.txn_record(msg.start_ts);
-            if txn_record.keys.contains_key(&msg.key) {
+            if self.txn_record(msg.start_ts).1.keys.contains_key(&msg.key) {
                 // Check we have locked this key.
                 let record = self.record(msg.key);
                 assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
             } else {
-                self.aquire_lock_and_set_value(msg.key, msg.start_ts, None);
+                if let Err(s) = self.aquire_lock_and_set_value(msg.key, msg.start_ts, None) {
+                    self.fail(&*msg, s)?;
+                    return Ok(());
+                }
+                let (_latch, txn_record) = self.txn_record(msg.start_ts);
                 txn_record.keys.insert(msg.key, TxnState::Local);
             }
         }
@@ -73,22 +77,38 @@ impl Server {
 
     fn handle_prewrite(&self, msg: Box<messages::PrewriteRequest>) -> Result<(), String> {
         eprintln!("prewrite {:?} {:?}", msg.start_ts, msg.writes);
+        let mut locked = Vec::new();
+        for &(k, v) in &msg.writes {
+            eprintln!("prewrite key {:?} {:?}", msg.start_ts, k);
+            if self.txn_record(msg.start_ts).1.keys.contains_key(&k) {
+                // Key is already locked, just need to write the value.
+                let record = self.record(k);
+                assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
+                record.values.insert(msg.start_ts, v);
+            } else {
+                // Lock and set value.
+                if let Err(s) = self.aquire_lock_and_set_value(k, msg.start_ts, Some(v)) {
+                    eprintln!("Failed to lock {:?} {:?}", k, msg.start_ts);
+                    // Unlock any keys we previously locked.
+                    let (_latch, txn_record) = self.txn_record(msg.start_ts);
+                    for &k in &locked {
+                        txn_record.keys.remove(&k);
+                        let _latch = latch::block_on_latch(&self.latches, k);
+                        let record = self.assert_record(k);
+                        assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
+                        record.lock = None;
+                    }
+                    self.fail(&*msg, s)?;
+                    return Ok(());
+                }
+                let (_latch, txn_record) = self.txn_record(msg.start_ts);
+                txn_record.keys.insert(k, TxnState::Local);
+                locked.push(k);
+            }
+        }
+
         {
             let (_latch, txn_record) = self.txn_record(msg.start_ts);
-            for &(k, v) in &msg.writes {
-                eprintln!("prewrite key {:?} {:?}", msg.start_ts, k);
-                if txn_record.keys.contains_key(&k) {
-                    // Key is already locked, just need to write the value.
-                    let record = self.record(k);
-                    assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
-                    record.values.insert(msg.start_ts, v);
-                } else {
-                    // Lock and set value.
-                    self.aquire_lock_and_set_value(k, msg.start_ts, Some(v));
-                    txn_record.keys.insert(k, TxnState::Local);
-                }
-            }
-
             txn_record.commit_ts = Some(msg.commit_ts);
         }
 
@@ -103,28 +123,54 @@ impl Server {
         self.finalise_txn(msg.start_ts)
     }
 
+    fn handle_rollback(&self, msg: Box<messages::RollbackRequest>) -> Result<(), String> {
+        eprintln!("rollback {:?}", msg.start_ts);
+        for k in msg.keys {
+            let _latch = latch::block_on_latch(&self.latches, k);
+            let record = self.assert_record(k);
+            assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
+            record.lock = None;
+        }
+        self.remove_txn_record(msg.start_ts);
+        // TODO ack?
+        Ok(())
+    }
+
     // Precondition: lock must not be held by txn start_ts
-    fn aquire_lock_and_set_value(&self, key: Key, start_ts: Ts, value: Option<Value>) {
-        // TODO can we recover or return to client instead of blocking
+    fn aquire_lock_and_set_value(
+        &self,
+        key: Key,
+        start_ts: Ts,
+        value: Option<Value>,
+    ) -> Result<(), String> {
+        // TODO should we recover or return to client instead of blocking
         let mut sleeps = 100;
         loop {
-            let _latch = latch::block_on_latch(&self.latches, key);
-            let record = self.record(key);
+            {
+                let _latch = latch::block_on_latch(&self.latches, key);
+                eprintln!("aquired latch, getting record {:?}", key);
+                let record = self.record(key);
+                eprintln!("got record {:?}", key);
 
-            if record.lock.is_none() {
-                record.lock = Some(Lock {
-                    start_ts,
-                    state: TxnState::Local,
-                });
+                if record.lock.is_none() {
+                    record.lock = Some(Lock {
+                        start_ts,
+                        state: TxnState::Local,
+                    });
 
-                if let Some(v) = value {
-                    let exists = record.values.insert(start_ts, v);
-                    assert!(exists.is_none());
+                    if let Some(v) = value {
+                        let exists = record.values.insert(start_ts, v);
+                        assert!(exists.is_none());
+                    }
+                    return Ok(());
                 }
-                return;
-            }
-            if sleeps <= 0 {
-                panic!("timed out waiting for lock on {:?}", key);
+                if sleeps <= 0 {
+                    return Err(format!(
+                        "timed out waiting for lock on {:?}, locked by {:?}",
+                        key,
+                        record.lock.as_ref().unwrap().start_ts
+                    ));
+                }
             }
             thread::sleep(Duration::from_millis(20));
             sleeps -= 1;
@@ -136,7 +182,14 @@ impl Server {
     }
 
     fn assert_record(&self, key: Key) -> &mut Record {
-        unsafe { self.keys.get().as_mut().expect(&format!("assert_record failed {:?}", key)).get_mut(&key).unwrap() }
+        unsafe {
+            self.keys
+                .get()
+                .as_mut()
+                .unwrap()
+                .get_mut(&key)
+                .expect(&format!("assert_record failed {:?}", key))
+        }
     }
 
     fn txn_record<'a>(&'a self, start_ts: Ts) -> (latch::Latch<'a, Ts>, &mut TxnRecord) {
@@ -166,7 +219,11 @@ impl Server {
                     .as_mut()
                     .unwrap()
                     .get_mut(&start_ts)
-                    .expect(&format!("assert_txn_record failed {:?}", start_ts)),
+                    .expect(&format!(
+                        "assert_txn_record failed {:?} {:?}",
+                        start_ts,
+                        self.txns.get().as_ref().unwrap()
+                    )),
             )
         }
     }
@@ -178,6 +235,14 @@ impl Server {
 
     fn ack<T: MsgRequest>(&self, msg: &T) -> Result<(), String> {
         let msg = msg.ack();
+        self.transport
+            .send(Box::new(msg))
+            .map_err(|e| e.to_string())
+    }
+
+    fn fail<T: MsgRequest + fmt::Debug>(&self, msg: &T, s: String) -> Result<(), String> {
+        eprintln!("Message handling failed {:?}: {}", msg, s);
+        let msg = msg.response(false);
         self.transport
             .send(Box::new(msg))
             .map_err(|e| e.to_string())
@@ -196,14 +261,17 @@ impl Server {
         thread::sleep(Duration::from_millis(wait_time));
     }
 
-    fn update_lock_state(&self, key: Key, txn_record: &mut TxnRecord) {
-        let _latch = latch::block_on_latch(&self.latches, key);
-        let record = self.assert_record(key);
-        match &mut record.lock {
-            Some(lock) => lock.state = TxnState::Consensus,
-            None => panic!("Expected lock (for {:?}), found none", key),
+    fn update_lock_state(&self, key: Key, start_ts: Ts) {
+        {
+            let _latch = latch::block_on_latch(&self.latches, key);
+            let record = self.assert_record(key);
+            match &mut record.lock {
+                Some(lock) => lock.state = TxnState::Consensus,
+                None => panic!("Expected lock (for {:?}), found none", key),
+            }
         }
 
+        let (_latch, txn_record) = self.assert_txn_record(start_ts);
         match txn_record.keys.get_mut(&key) {
             Some(key) => *key = TxnState::Consensus,
             None => panic!("Expected key {:?}, found none", key),
@@ -213,8 +281,7 @@ impl Server {
     fn async_consensus_write_lock(&self, msg: &messages::LockRequest) -> Result<(), String> {
         Server::wait_for_consensus();
 
-        let (_latch, txn_record) = self.assert_txn_record(msg.start_ts);
-        self.update_lock_state(msg.key, txn_record);
+        self.update_lock_state(msg.key, msg.start_ts);
         eprintln!("consensus lock complete {:?} {:?}", msg.start_ts, msg.key);
 
         // We could check all keys and set the record lock state.
@@ -229,9 +296,8 @@ impl Server {
         // Assumes we do one consensus write for all writes in the transaction.
         Server::wait_for_consensus();
 
-        let (_latch, txn_record) = self.assert_txn_record(msg.start_ts);
         for &(k, _) in &msg.writes {
-            self.update_lock_state(k, txn_record);
+            self.update_lock_state(k, msg.start_ts);
         }
         eprintln!(
             "consensus prewrite complete {:?} {:?}",
@@ -254,11 +320,12 @@ impl Server {
                 k,
                 start_ts
             );
-            latch::block_on_latch(&self.latches, k);
+            let _latch = latch::block_on_latch(&self.latches, k);
             let record = self.assert_record(k);
+            eprintln!("unlock {:?} {:?}", k, start_ts);
             record.lock = None;
             if !record.writes.is_empty() {
-                // FIXME is thus always true?
+                // FIXME is this always true?
                 assert!(record.writes.last().unwrap().0 > txn_record.commit_ts.unwrap());
             }
             // TODO don't write if we only locked for a read
@@ -280,10 +347,12 @@ impl transport::Receiver for Server {
         let msg = match msg.downcast() {
             Ok(msg) => {
                 let this = self.clone();
-                // TODO handle error?
                 thread::spawn(move || {
                     this.thread_count.fetch_add(1, Ordering::SeqCst);
-                    this.handle_lock(msg).unwrap();
+                    if let Err(s) = this.handle_lock(msg) {
+                        // TODO handle error?
+                        panic!(s);
+                    }
                     this.thread_count.fetch_sub(1, Ordering::SeqCst);
                 });
                 return Ok(());
@@ -316,13 +385,29 @@ impl transport::Receiver for Server {
             }
             Err(msg) => msg,
         };
+        let msg = match msg.downcast() {
+            Ok(msg) => {
+                let this = self.clone();
+                // TODO handle error?
+                thread::spawn(move || {
+                    this.thread_count.fetch_add(1, Ordering::SeqCst);
+                    this.handle_rollback(msg).unwrap();
+                    this.thread_count.fetch_sub(1, Ordering::SeqCst);
+                });
+                return Ok(());
+            }
+            Err(msg) => msg,
+        };
         Err(format!("Unknown message type: {:?}", msg.type_id()))
     }
 
     fn handle_shutdown(self: Arc<Self>) -> Result<(), String> {
         eprintln!("handle_shutdown");
         while self.thread_count.load(Ordering::SeqCst) > 0 {
-            println!("waiting for threads...");
+            println!(
+                "waiting for {} threads...",
+                self.thread_count.load(Ordering::SeqCst)
+            );
             thread::sleep(Duration::from_millis(100));
         }
         Ok(())

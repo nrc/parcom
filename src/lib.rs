@@ -1,5 +1,6 @@
 // TODO
 //
+// multi-threaded client
 // timeouts
 // non-locking reads (and the reading part of locking reads)
 // recovery
@@ -23,9 +24,9 @@ mod messages;
 mod server;
 mod transport;
 
-const READS_PER_TXN: usize = 10;
-const WRITES_PER_TXN: usize = 10;
-const TXNS: usize = 10;
+const READS_PER_TXN: usize = 3;
+const WRITES_PER_TXN: usize = 3;
+const TXNS: usize = 3;
 const MAX_KEY: u64 = 1000;
 const MIN_CONSENSUS_TIME: u64 = 10;
 const MAX_CONSENSUS_TIME: u64 = 100;
@@ -75,7 +76,7 @@ pub fn start() {
     }
 
     // FIXME this is a hack, better to wait for all operations to complete before starting shutdown.
-    thread::sleep(Duration::from_millis(1000));
+    thread::sleep(Duration::from_millis(1000000));
 
     client.shutdown();
     j2.join().unwrap();

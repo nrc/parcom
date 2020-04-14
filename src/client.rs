@@ -41,9 +41,10 @@ impl Client {
 
             for _ in 0..READS_PER_TXN {
                 let key = self.exec_lock(start_ts)?;
-                txn.locks.push(key);
+                txn.locks.push((key, false));
             }
-            self.exec_prewrite(start_ts)?;
+            let keys = self.exec_prewrite(start_ts)?;
+            txn.prewrite = Some((keys, false));
         }
         // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
         // TODO block waiting for responses.
@@ -64,10 +65,11 @@ impl Client {
             .map(|_| key)
     }
 
-    fn exec_prewrite(&self, start_ts: Ts) -> Result<(), String> {
-        let writes = (0..WRITES_PER_TXN)
+    fn exec_prewrite(&self, start_ts: Ts) -> Result<Vec<Key>, String> {
+        let writes: Vec<_> = (0..WRITES_PER_TXN)
             .map(|_| (random_key(), random_value()))
             .collect();
+        let keys = writes.iter().map(|&(k, _)| k).collect();
         // eprintln!("write {:?}", writes);
         let msg = messages::PrewriteRequest {
             start_ts,
@@ -77,24 +79,32 @@ impl Client {
         self.transport
             .send(Box::new(msg))
             .map_err(|e| e.to_string())
+            .map(|_| keys)
     }
 
     fn handle_prewrite_response(&self, msg: Box<messages::PrewriteResponse>) -> Result<(), String> {
         // TODO retry if no success
-        assert!(msg.success);
-        self.assert_txn(msg.start_ts).1.prewrite = true;
+        if !msg.success {
+            return self.rollback(msg.start_ts);
+        }
+        self.assert_txn(msg.start_ts).1.prewrite.as_mut().unwrap().1 = true;
         self.check_responses_and_commit(msg.start_ts)?;
         Ok(())
     }
 
     fn handle_lock_response(&self, msg: Box<messages::LockResponse>) -> Result<(), String> {
         // TODO retry if no success
-        assert!(msg.success);
-        self.assert_txn(msg.start_ts)
-            .1
-            .locks
-            .remove_item(&msg.key)
-            .unwrap();
+        if !msg.success {
+            return self.rollback(msg.start_ts);
+        }
+        {
+            let (_latch, txn) = self.assert_txn(msg.start_ts);
+            for &mut (k, ref mut b) in &mut txn.locks {
+                if k == msg.key {
+                    *b = true;
+                }
+            }
+        }
         self.check_responses_and_commit(msg.start_ts)?;
         Ok(())
     }
@@ -105,6 +115,18 @@ impl Client {
         }
 
         let msg = messages::FinaliseRequest { start_ts };
+        self.transport
+            .send(Box::new(msg))
+            .map_err(|e| e.to_string())
+    }
+
+    fn rollback(&self, start_ts: Ts) -> Result<(), String> {
+        let (_latch, txn) = self.assert_txn(start_ts);
+        assert!(!txn.complete());
+        let msg = messages::RollbackRequest {
+            start_ts,
+            keys: txn.keys(),
+        };
         self.transport
             .send(Box::new(msg))
             .map_err(|e| e.to_string())
@@ -164,19 +186,36 @@ fn random_value() -> Value {
 }
 
 struct Txn {
-    locks: Vec<Key>,
-    prewrite: bool,
+    locks: Vec<(Key, bool)>,
+    prewrite: Option<(Vec<Key>, bool)>,
 }
 
 impl Txn {
     fn new() -> Box<Txn> {
         Box::new(Txn {
             locks: Vec::new(),
-            prewrite: false,
+            prewrite: None,
         })
     }
 
     fn complete(&self) -> bool {
-        self.prewrite && self.locks.is_empty()
+        match &self.prewrite {
+            Some((_, true)) => {}
+            _ => return false,
+        }
+
+        self.locks.iter().all(|(_, b)| *b)
+    }
+
+    fn keys(&self) -> Vec<Key> {
+        self.locks
+            .iter()
+            .map(|&(k, _)| k)
+            .chain(
+                self.prewrite
+                    .iter()
+                    .flat_map(|&(ref vks, _)| vks.iter().cloned()),
+            )
+            .collect()
     }
 }
