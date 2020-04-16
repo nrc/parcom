@@ -1,15 +1,10 @@
 use crate::*;
 use rand::{self, Rng};
-use std::{
-    any,
-    cell::UnsafeCell,
-    collections::{HashMap, HashSet},
-    sync::Mutex,
-};
+use std::{any, cell::UnsafeCell, sync::Mutex};
 
 pub struct Client {
-    txns: UnsafeCell<HashMap<Ts, Box<Txn>>>,
-    txn_latches: Mutex<HashSet<Ts>>,
+    txns: UnsafeCell<Box<[Option<Txn>; TXNS]>>,
+    txn_latches: Mutex<Box<[bool; TXNS]>>,
     tso: Tso,
     transport: transport::TransportSend,
 }
@@ -17,8 +12,8 @@ pub struct Client {
 impl Client {
     pub fn new(tso: Tso, transport: transport::TransportSend) -> Client {
         Client {
-            txns: UnsafeCell::new(HashMap::new()),
-            txn_latches: Mutex::new(HashSet::new()),
+            txns: UnsafeCell::new(Box::new([None; TXNS])),
+            txn_latches: Mutex::new(Box::new([false; TXNS])),
             tso,
             transport,
         }
@@ -30,30 +25,33 @@ impl Client {
 
     pub fn exec_txn(&self) {
         let start_ts = self.tso.ts();
+        let id = self.tso.id();
 
         {
-            let _latch = latch::block_on_latch(&self.txn_latches, start_ts);
+            let _latch = latch::block_on_latch(&self.txn_latches, id);
             let txn: &mut Txn = unsafe {
                 let txns = self.txns.get().as_mut().unwrap();
-                txns.insert(start_ts, Txn::new());
-                txns.get_mut(&start_ts).unwrap()
+                txns[id.into(): usize] = Some(Txn::new());
+                ((&mut txns[id.into(): usize]): &mut Option<Txn>)
+                    .as_mut()
+                    .unwrap()
             };
 
             for _ in 0..READS_PER_TXN {
-                let key = self.exec_lock(start_ts);
+                let key = self.exec_lock(id, start_ts);
                 txn.locks.push((key, false));
             }
-            let keys = self.exec_prewrite(start_ts);
+            let keys = self.exec_prewrite(id, start_ts);
             txn.prewrite = Some((keys, false));
         }
         // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
         // TODO block waiting for responses.
     }
 
-    fn exec_lock(&self, start_ts: Ts) -> Key {
+    fn exec_lock(&self, id: TxnId, start_ts: Ts) -> Key {
         let key = random_key();
-        // eprintln!("lock {:?}", key);
         let msg = messages::LockRequest {
+            id,
             key,
             start_ts,
             for_update_ts: self.tso.ts(),
@@ -62,13 +60,13 @@ impl Client {
         key
     }
 
-    fn exec_prewrite(&self, start_ts: Ts) -> Vec<Key> {
+    fn exec_prewrite(&self, id: TxnId, start_ts: Ts) -> Vec<Key> {
         let writes: Vec<_> = (0..WRITES_PER_TXN)
             .map(|_| (random_key(), random_value()))
             .collect();
         let keys = writes.iter().map(|&(k, _)| k).collect();
-        // eprintln!("write {:?}", writes);
         let msg = messages::PrewriteRequest {
+            id,
             start_ts,
             commit_ts: self.tso.ts(),
             writes,
@@ -80,56 +78,57 @@ impl Client {
     fn handle_prewrite_response(&self, msg: Box<messages::PrewriteResponse>) {
         // TODO retry if no success
         if !msg.success {
-            return self.rollback(msg.start_ts);
+            return self.rollback(msg.id);
         }
-        self.assert_txn(msg.start_ts).1.prewrite.as_mut().unwrap().1 = true;
-        self.check_responses_and_commit(msg.start_ts);
+        self.assert_txn(msg.id).1.prewrite.as_mut().unwrap().1 = true;
+        self.check_responses_and_commit(msg.id);
     }
 
     fn handle_lock_response(&self, msg: Box<messages::LockResponse>) {
         // TODO retry if no success
         if !msg.success {
-            return self.rollback(msg.start_ts);
+            return self.rollback(msg.id);
         }
         {
-            let (_latch, txn) = self.assert_txn(msg.start_ts);
+            let (_latch, txn) = self.assert_txn(msg.id);
             for &mut (k, ref mut b) in &mut txn.locks {
                 if k == msg.key {
                     *b = true;
                 }
             }
         }
-        self.check_responses_and_commit(msg.start_ts);
+        self.check_responses_and_commit(msg.id);
     }
 
-    fn check_responses_and_commit(&self, start_ts: Ts) {
-        if !self.assert_txn(start_ts).1.complete() {
-            return;
+    fn check_responses_and_commit(&self, id: TxnId) {
+        {
+            let (_latch, txn) = self.assert_txn(id);
+            if !txn.complete() || txn.rolled_back {
+                return;
+            }
         }
 
-        let msg = messages::FinaliseRequest { start_ts };
+        let msg = messages::FinaliseRequest { id };
         self.transport.send(Box::new(msg));
     }
 
-    fn rollback(&self, start_ts: Ts) {
-        let (_latch, txn) = self.assert_txn(start_ts);
+    fn rollback(&self, id: TxnId) {
+        let (_latch, txn) = self.assert_txn(id);
         assert!(!txn.complete());
+        txn.rolled_back = true;
         let msg = messages::RollbackRequest {
-            start_ts,
+            id,
             keys: txn.keys(),
         };
         self.transport.send(Box::new(msg));
     }
 
-    fn assert_txn<'a>(&'a self, start_ts: Ts) -> (latch::Latch<'a, Ts>, &mut Txn) {
+    fn assert_txn<'a>(&'a self, id: TxnId) -> (latch::Latch<'a, { TXNS }>, &mut Txn) {
         loop {
-            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, start_ts) {
+            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, id) {
                 let txn = unsafe {
-                    self.txns
-                        .get()
+                    self.txns.get().as_mut().unwrap()[id.into(): usize]
                         .as_mut()
-                        .unwrap()
-                        .get_mut(&start_ts)
                         .unwrap()
                 };
                 return (latch, txn);
@@ -187,14 +186,16 @@ fn random_value() -> Value {
 struct Txn {
     locks: Vec<(Key, bool)>,
     prewrite: Option<(Vec<Key>, bool)>,
+    rolled_back: bool,
 }
 
 impl Txn {
-    fn new() -> Box<Txn> {
-        Box::new(Txn {
+    fn new() -> Txn {
+        Txn {
             locks: Vec::new(),
             prewrite: None,
-        })
+            rolled_back: false,
+        }
     }
 
     fn complete(&self) -> bool {

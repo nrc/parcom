@@ -11,6 +11,7 @@ pub trait MsgRequest {
 #[derive(Debug, Clone)]
 pub struct LockRequest {
     pub key: Key,
+    pub id: TxnId,
     pub start_ts: Ts,
     pub for_update_ts: Ts,
 }
@@ -22,14 +23,14 @@ impl MsgRequest for LockRequest {
     fn ack(&self) -> LockAck {
         LockAck {
             key: self.key,
-            start_ts: self.start_ts,
+            id: self.id,
         }
     }
 
     fn response(&self, success: bool) -> LockResponse {
         LockResponse {
             key: self.key,
-            start_ts: self.start_ts,
+            id: self.id,
             success,
         }
     }
@@ -37,20 +38,21 @@ impl MsgRequest for LockRequest {
 
 #[derive(Debug, Clone)]
 pub struct LockAck {
+    pub id: TxnId,
     pub key: Key,
-    pub start_ts: Ts,
 }
 
 #[derive(Debug, Clone)]
 pub struct LockResponse {
+    pub id: TxnId,
     pub key: Key,
-    pub start_ts: Ts,
     // FIXME needs more detail if we want to retry
     pub success: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct PrewriteRequest {
+    pub id: TxnId,
     pub start_ts: Ts,
     pub commit_ts: Ts,
     pub writes: Vec<(Key, Value)>,
@@ -61,14 +63,12 @@ impl MsgRequest for PrewriteRequest {
     type Ack = PrewriteAck;
 
     fn ack(&self) -> PrewriteAck {
-        PrewriteAck {
-            start_ts: self.start_ts,
-        }
+        PrewriteAck { id: self.id }
     }
 
     fn response(&self, success: bool) -> PrewriteResponse {
         PrewriteResponse {
-            start_ts: self.start_ts,
+            id: self.id,
             success,
         }
     }
@@ -76,19 +76,19 @@ impl MsgRequest for PrewriteRequest {
 
 #[derive(Debug, Clone)]
 pub struct PrewriteAck {
-    pub start_ts: Ts,
+    pub id: TxnId,
 }
 
 #[derive(Debug, Clone)]
 pub struct PrewriteResponse {
-    pub start_ts: Ts,
+    pub id: TxnId,
     // FIXME needs more detail if we want to retry
     pub success: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct FinaliseRequest {
-    pub start_ts: Ts,
+    pub id: TxnId,
 }
 
 impl MsgRequest for FinaliseRequest {
@@ -106,7 +106,7 @@ impl MsgRequest for FinaliseRequest {
 
 #[derive(Debug, Clone)]
 pub struct RollbackRequest {
-    pub start_ts: Ts,
+    pub id: TxnId,
     pub keys: Vec<Key>,
 }
 

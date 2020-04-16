@@ -8,8 +8,13 @@
 // deadlock
 // consensus write after failure
 // for_update_ts
+// add a User, check invariants
 
+#![allow(incomplete_features)]
+#![feature(const_generics)]
+#![feature(const_in_array_repeat_expressions)]
 #![feature(never_type)]
+#![feature(type_ascription)]
 #![feature(vec_remove_item)]
 
 use std::{
@@ -27,36 +32,59 @@ mod transport;
 const READS_PER_TXN: usize = 3;
 const WRITES_PER_TXN: usize = 3;
 const TXNS: usize = 10;
-const MAX_KEY: u64 = 1000;
+const MAX_KEY: usize = 1000;
 const MIN_CONSENSUS_TIME: u64 = 10;
 const MAX_CONSENSUS_TIME: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct Tso {
-    next: Arc<Mutex<u64>>,
+    next_ts: Arc<Mutex<usize>>,
+    next_id: Arc<Mutex<usize>>,
 }
 
 impl Tso {
     fn new() -> Tso {
         Tso {
-            next: Arc::new(Mutex::new(0)),
+            next_ts: Arc::new(Mutex::new(0)),
+            next_id: Arc::new(Mutex::new(0)),
         }
     }
 
     fn ts(&self) -> Ts {
-        let mut next = self.next.lock().unwrap();
+        let mut next = self.next_ts.lock().unwrap();
         let result = Ts(*next);
+        *next += 1;
+        result
+    }
+
+    fn id(&self) -> TxnId {
+        let mut next = self.next_id.lock().unwrap();
+        let result = TxnId(*next);
         *next += 1;
         result
     }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct Key(u64);
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
-pub struct Ts(u64);
+pub struct Key(usize);
 #[derive(Debug, Copy, Clone, Default)]
-pub struct Value(u64);
+pub struct Value(usize);
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct Ts(usize);
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct TxnId(usize);
+
+impl Into<usize> for Key {
+    fn into(self) -> usize {
+        self.0
+    }
+}
+
+impl Into<usize> for TxnId {
+    fn into(self) -> usize {
+        self.0
+    }
+}
 
 pub fn start() {
     let tso = Tso::new();

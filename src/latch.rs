@@ -1,24 +1,25 @@
-use std::{collections::HashSet, fmt, hash::Hash, sync::Mutex, thread, time::Duration};
+use std::{fmt, sync::Mutex, thread, time::Duration};
 
-pub struct Latch<'a, T: Eq + Hash> {
-    key: T,
-    latches: &'a Mutex<HashSet<T>>,
+pub struct Latch<'a, const N: usize> {
+    key: usize,
+    latches: &'a Mutex<Box<[bool; { N }]>>,
 }
 
-pub fn block_on_latch<'a, T: Copy + Eq + Hash + fmt::Debug>(
-    latches: &'a Mutex<HashSet<T>>,
+pub fn block_on_latch<'a, T: Into<usize> + Copy + fmt::Debug, const N: usize>(
+    latches: &'a Mutex<Box<[bool; { N }]>>,
     key: T,
-) -> Result<Latch<'a, T>, String> {
-    // eprintln!("Latch {:?}", key);
+) -> Result<Latch<'a, { N }>, String> {
     let mut sleep_count = 100;
+    let key = key.into();
     loop {
         if sleep_count == 0 {
             return Err(format!("Timed out waiting for latch {:?}", key));
         }
         {
             let mut latches = latches.lock().unwrap();
-            if !latches.contains(&key) {
-                latches.insert(key);
+            if !latches[key] {
+                // eprintln!("Latch {:?}", key);
+                latches[key] = true;
                 break;
             }
         }
@@ -29,9 +30,10 @@ pub fn block_on_latch<'a, T: Copy + Eq + Hash + fmt::Debug>(
     Ok(Latch { key, latches })
 }
 
-impl<'a, T: Eq + Hash> Drop for Latch<'a, T> {
+impl<'a, const N: usize> Drop for Latch<'a, { N }> {
     fn drop(&mut self) {
+        // eprintln!("drop latch for {:?}", self.key);
         let mut latches = self.latches.lock().unwrap();
-        latches.remove(&self.key);
+        latches[self.key] = false;
     }
 }

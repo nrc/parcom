@@ -1,6 +1,6 @@
 use crate::messages::Shutdown;
 use std::{
-    any, mem,
+    any,
     sync::{mpsc, Arc, Condvar, Mutex},
     thread,
 };
@@ -40,12 +40,14 @@ struct Resender {
 
 impl TransportSend {
     pub fn send(&self, msg: Box<dyn any::Any + Send>) {
-        self.queue.0.lock().unwrap().push(msg);
+        let mut queue = self.queue.0.lock().unwrap();
+        queue.push(msg);
         self.queue.1.notify_one();
     }
 
     pub fn shutdown(&self) {
-        self.queue.0.lock().unwrap().push(Box::new(Shutdown));
+        let mut queue = self.queue.0.lock().unwrap();
+        queue.push(Box::new(Shutdown));
         self.queue.1.notify_one();
     }
 }
@@ -53,20 +55,16 @@ impl TransportSend {
 impl Resender {
     fn start(&self) {
         loop {
-            let queue = {
-                let mut queue_guard = self.queue.0.lock().unwrap();
-                mem::take(&mut *queue_guard)
-            };
+            let mut queue = self.queue.0.lock().unwrap();
 
-            for msg in queue {
+            for msg in queue.drain(..) {
                 self.channel
                     .send(msg)
                     .map_err(|e| format!("Sending message failed: {}", e))
                     .unwrap();
             }
 
-            let queue_guard = self.queue.0.lock().unwrap();
-            let _ = self.queue.1.wait(queue_guard).unwrap();
+            let _ = self.queue.1.wait(queue).unwrap();
         }
     }
 }

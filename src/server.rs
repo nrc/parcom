@@ -3,7 +3,7 @@ use rand::{self, Rng};
 use std::{
     any,
     cell::UnsafeCell,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -16,10 +16,10 @@ use std::{
 pub struct Server {
     // We use txn records indexed by start TS, rather than storing this info on the primary lock.
     // The two approaches are equivalent.
-    txns: UnsafeCell<HashMap<Ts, Box<TxnRecord>>>,
-    keys: UnsafeCell<HashMap<Key, Box<Record>>>,
-    latches: Mutex<HashSet<Key>>,
-    txn_latches: Mutex<HashSet<Ts>>,
+    txns: UnsafeCell<Box<[Option<TxnRecord>; TXNS]>>,
+    keys: UnsafeCell<Box<[Option<Record>; MAX_KEY]>>,
+    latches: Mutex<Box<[bool; MAX_KEY]>>,
+    txn_latches: Mutex<Box<[bool; TXNS]>>,
     transport: transport::TransportSend,
     thread_count: AtomicU64,
 }
@@ -28,10 +28,10 @@ impl Server {
     pub fn new(transport: transport::TransportSend) -> Server {
         Server {
             transport,
-            txns: UnsafeCell::new(HashMap::new()),
-            keys: UnsafeCell::new(HashMap::new()),
-            latches: Mutex::new(HashSet::new()),
-            txn_latches: Mutex::new(HashSet::new()),
+            txns: UnsafeCell::new(Box::new([None; TXNS])),
+            keys: UnsafeCell::new(Box::new([None; MAX_KEY])),
+            latches: Mutex::new(Box::new([false; MAX_KEY])),
+            txn_latches: Mutex::new(Box::new([false; TXNS])),
             thread_count: AtomicU64::new(0),
         }
     }
@@ -44,27 +44,29 @@ impl Server {
                 .get()
                 .as_mut()
                 .unwrap()
-                .values()
-                .for_each(|k| assert!(k.lock.is_none()));
+                .iter()
+                .for_each(|k| assert!(k.is_none() || k.as_ref().unwrap().lock.is_none()));
         }
 
         self.transport.shutdown();
     }
 
     fn handle_lock(&self, msg: Box<messages::LockRequest>) {
-        eprintln!("lock {:?} {:?}", msg.key, msg.start_ts);
+        // eprintln!("lock {:?} {:?}", msg.key, msg.id);
         {
             // TODO record writes or locks or both?
-            if self.txn_contains_key(msg.start_ts, msg.key) {
+            if self.txn_contains_key(msg.id, msg.key, msg.start_ts) {
                 // Check we have locked this key.
                 let record = self.record(msg.key);
-                assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
+                assert_eq!(record.lock.as_ref().expect("Missing lock").id, msg.id);
             } else {
-                if let Err(s) = self.aquire_lock_and_set_value(msg.key, msg.start_ts, None) {
+                if let Err(s) = self.aquire_lock_and_set_value(msg.key, msg.id, msg.start_ts, None)
+                {
                     self.fail(&*msg, s);
                     return;
                 }
-                let (_latch, txn_record) = self.txn_record(msg.start_ts);
+                let (_latch, txn_record) = self.txn_record(msg.id, msg.start_ts);
+                assert_eq!(msg.start_ts, txn_record.start_ts);
                 txn_record.keys.insert(msg.key, TxnState::Local);
             }
         }
@@ -74,33 +76,33 @@ impl Server {
     }
 
     fn handle_prewrite(&self, msg: Box<messages::PrewriteRequest>) {
-        eprintln!("prewrite {:?} {:?}", msg.start_ts, msg.writes);
+        // eprintln!("prewrite {:?} {:?}", msg.id, msg.writes);
         let mut locked = Vec::new();
         for &(k, v) in &msg.writes {
-            // eprintln!("prewrite key {:?} {:?}", msg.start_ts, k);
-            if self.txn_contains_key(msg.start_ts, k) {
+            // eprintln!("prewrite key {:?} {:?}", msg.id, k);
+            if self.txn_contains_key(msg.id, k, msg.start_ts) {
                 // Key is already locked, just need to write the value.
                 let record = self.record(k);
-                assert!(record.lock.as_ref().unwrap().start_ts == msg.start_ts);
+                assert!(record.lock.as_ref().unwrap().id == msg.id);
                 record.values.insert(msg.start_ts, v);
             } else {
                 // Lock and set value.
-                if let Err(s) = self.aquire_lock_and_set_value(k, msg.start_ts, Some(v)) {
-                    // eprintln!("Failed to lock {:?} {:?}", k, msg.start_ts);
-                    while let Err(_) = self.abort_prewrite(msg.start_ts, &locked) {
+                if let Err(s) = self.aquire_lock_and_set_value(k, msg.id, msg.start_ts, Some(v)) {
+                    // eprintln!("Failed to lock {:?} {:?}", k, msg.id);
+                    while let Err(_) = self.abort_prewrite(msg.id, &locked) {
                         thread::sleep(Duration::from_millis(50));
                     }
                     self.fail(&*msg, s);
                     return;
                 }
-                let (_latch, txn_record) = self.txn_record(msg.start_ts);
+                let (_latch, txn_record) = self.txn_record(msg.id, msg.start_ts);
                 txn_record.keys.insert(k, TxnState::Local);
                 locked.push(k);
             }
         }
 
         {
-            let (_latch, txn_record) = self.txn_record(msg.start_ts);
+            let (_latch, txn_record) = self.txn_record(msg.id, msg.start_ts);
             txn_record.commit_ts = Some(msg.commit_ts);
         }
 
@@ -109,25 +111,26 @@ impl Server {
     }
 
     fn handle_finalise(&self, msg: Box<messages::FinaliseRequest>) {
-        eprintln!("finalise {:?}", msg.start_ts);
-        while let Err(_) = self.finalise_txn(msg.start_ts) {
+        // eprintln!("finalise {:?}", msg.id);
+        while let Err(_) = self.finalise_txn(&msg) {
             thread::sleep(Duration::from_millis(50));
         }
     }
 
     fn handle_rollback(&self, msg: Box<messages::RollbackRequest>) {
-        eprintln!("rollback {:?}", msg.start_ts);
+        // eprintln!("rollback {:?}", msg.id);
         // Retry the rollback since failure must be due to latch deadlock.
         while let Err(_) = self.rollback_txn(&msg) {
             thread::sleep(Duration::from_millis(50));
         }
     }
 
-    // Precondition: lock must not be held by txn start_ts.
+    // Precondition: lock must not be held by txn id.
     // No latches may be held.
     fn aquire_lock_and_set_value(
         &self,
         key: Key,
+        id: TxnId,
         start_ts: Ts,
         value: Option<Value>,
     ) -> Result<(), String> {
@@ -146,7 +149,7 @@ impl Server {
                         LockKind::Read
                     };
                     record.lock = Some(Lock {
-                        start_ts,
+                        id,
                         state: TxnState::Local,
                         kind: lock_kind,
                     });
@@ -156,7 +159,7 @@ impl Server {
                     Err(format!(
                         "Key locked {:?} by {:?}",
                         key,
-                        record.lock.as_ref().unwrap().start_ts
+                        record.lock.as_ref().unwrap().id
                     ))
                 };
             }
@@ -165,70 +168,75 @@ impl Server {
     }
 
     fn record(&self, key: Key) -> &mut Record {
-        unsafe { self.keys.get().as_mut().unwrap().entry(key).or_default() }
-    }
-
-    fn assert_record(&self, key: Key) -> &mut Record {
-        unsafe {
-            self.keys
-                .get()
-                .as_mut()
-                .unwrap()
-                .get_mut(&key)
-                .expect(&format!("assert_record failed {:?}", key))
+        let map = unsafe { self.keys.get().as_mut().unwrap() };
+        let key: usize = key.into();
+        match map[key] {
+            Some(ref mut r) => r,
+            None => {
+                map[key] = Some(Record::default());
+                map[key].as_mut().unwrap()
+            }
         }
     }
 
+    fn assert_record(&self, key: Key) -> &mut Record {
+        self.get_record(key)
+            .expect(&format!("assert_record failed {:?}", key))
+    }
+
+    fn get_record(&self, key: Key) -> Option<&mut Record> {
+        unsafe { self.keys.get().as_mut().unwrap()[key.into(): usize].as_mut() }
+    }
+
     // The caller should not hold any latches when calling this function.
-    fn txn_record<'a>(&'a self, start_ts: Ts) -> (latch::Latch<'a, Ts>, &mut TxnRecord) {
+    fn txn_record<'a>(
+        &'a self,
+        id: TxnId,
+        start_ts: Ts,
+    ) -> (latch::Latch<'a, { TXNS }>, &mut TxnRecord) {
         loop {
-            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, start_ts) {
-                return unsafe {
-                    (
-                        latch,
-                        self.txns
-                            .get()
-                            .as_mut()
-                            .unwrap()
-                            .entry(start_ts)
-                            .or_insert_with(|| TxnRecord::new(start_ts)),
-                    )
-                };
+            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, id) {
+                let id: usize = id.into();
+                unsafe {
+                    let map = self.txns.get().as_mut().unwrap();
+                    if let Some(ref mut txn_record) = map[id] {
+                        return (latch, txn_record);
+                    }
+                    map[id] = Some(TxnRecord::new(start_ts));
+                    return (latch, map[id].as_mut().unwrap());
+                }
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
-    fn txn_contains_key(&self, start_ts: Ts, key: Key) -> bool {
-        let (_latch, record) = self.txn_record(start_ts);
+    fn txn_contains_key(&self, id: TxnId, key: Key, start_ts: Ts) -> bool {
+        let (_latch, record) = self.txn_record(id, start_ts);
         record.keys.contains_key(&key)
     }
 
     // The caller should not hold any latches when calling this function.
-    fn assert_txn_record<'a>(&'a self, start_ts: Ts) -> (latch::Latch<'a, Ts>, &mut TxnRecord) {
+    fn get_txn_record<'a>(
+        &'a self,
+        id: TxnId,
+    ) -> Option<(latch::Latch<'a, { TXNS }>, &mut TxnRecord)> {
         loop {
-            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, start_ts) {
+            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, id) {
                 return unsafe {
-                    (
-                        latch,
-                        self.txns
-                            .get()
-                            .as_mut()
-                            .unwrap()
-                            .get_mut(&start_ts)
-                            .expect(&format!("assert_txn_record failed {:?}", start_ts)),
-                    )
+                    self.txns.get().as_mut().unwrap()[id.into(): usize]
+                        .as_mut()
+                        .map(|record| (latch, record))
                 };
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
-    fn remove_txn_record(&self, start_ts: Ts) {
+    fn remove_txn_record(&self, id: TxnId) {
         loop {
-            if let Ok(_latch) = latch::block_on_latch(&self.txn_latches, start_ts) {
+            if let Ok(_latch) = latch::block_on_latch(&self.txn_latches, id) {
                 unsafe {
-                    self.txns.get().as_mut().unwrap().remove(&start_ts).unwrap();
+                    self.txns.get().as_mut().unwrap()[id.into(): usize] = None;
                 }
                 return;
             }
@@ -252,15 +260,15 @@ impl Server {
         self.transport.send(Box::new(msg));
     }
 
-    fn abort_prewrite(&self, start_ts: Ts, locked: &[Key]) -> Result<(), String> {
+    fn abort_prewrite(&self, id: TxnId, locked: &[Key]) -> Result<(), String> {
         // Unlock any keys we previously locked.
-        let (_latch, txn_record) = self.txn_record(start_ts);
+        let (_latch, txn_record) = self.get_txn_record(id).unwrap();
         for &k in locked {
             txn_record.keys.remove(&k);
             let _latch = latch::block_on_latch(&self.latches, k)?;
             let record = self.assert_record(k);
             if let Some(lock) = record.lock.as_ref() {
-                if lock.start_ts == start_ts {
+                if lock.id == id {
                     record.lock = None;
                 }
             }
@@ -275,14 +283,27 @@ impl Server {
         thread::sleep(Duration::from_millis(wait_time));
     }
 
-    fn update_lock_state(&self, key: Key, start_ts: Ts) -> Result<(), String> {
-        let (_latch, txn_record) = self.assert_txn_record(start_ts);
+    fn update_lock_state(&self, key: Key, id: TxnId) -> Result<(), String> {
+        let (_latch, txn_record) = match self.get_txn_record(id) {
+            Some(tup) => tup,
+            None => return Err(format!("Transaction {:?} missing {:?}", id, key)),
+        };
         {
-            let _latch = latch::block_on_latch(&self.latches, key)?;
+            let _latch = loop {
+                if let Ok(latch) = latch::block_on_latch(&self.latches, key) {
+                    break latch;
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+
             let record = self.assert_record(key);
             match &mut record.lock {
-                Some(lock) => lock.state = TxnState::Consensus,
-                None => panic!("Expected lock (for {:?}), found none", key),
+                Some(lock) if lock.id == id => lock.state = TxnState::Consensus,
+                _ => {
+                    // Key has been unlocked (and possibly re-locked), which means the transaction
+                    // has been rolled back.
+                    return Ok(());
+                }
             }
         }
 
@@ -297,14 +318,16 @@ impl Server {
     fn async_consensus_write_lock(&self, msg: &messages::LockRequest) {
         Server::wait_for_consensus();
 
-        while let Err(_) = self.update_lock_state(msg.key, msg.start_ts) {
-            thread::sleep(Duration::from_millis(50));
+        match self.update_lock_state(msg.key, msg.id) {
+            Ok(_) => {
+                // eprintln!("consensus lock complete {:?} {:?}", msg.id, msg.key);
+
+                // We could check all keys and set the record lock state.
+
+                self.respond(msg);
+            }
+            Err(s) => self.fail(msg, s),
         }
-        // eprintln!("consensus lock complete {:?} {:?}", msg.start_ts, msg.key);
-
-        // We could check all keys and set the record lock state.
-
-        self.respond(msg);
     }
 
     fn async_consensus_write_prewrite(&self, msg: &messages::PrewriteRequest) {
@@ -312,37 +335,50 @@ impl Server {
         Server::wait_for_consensus();
 
         for &(k, _) in &msg.writes {
-            while let Err(_) = self.update_lock_state(k, msg.start_ts) {
-                thread::sleep(Duration::from_millis(50));
+            if let Err(s) = self.update_lock_state(k, msg.id) {
+                // Leaves locks messed up, but that should get sorted out when we rollback.
+                self.fail(msg, s);
+                return;
             }
         }
         // eprintln!(
         //     "consensus prewrite complete {:?} {:?}",
-        //     msg.start_ts, msg.writes
+        //     msg.id, msg.writes
         // );
 
         self.respond(msg);
     }
 
-    fn finalise_txn(&self, start_ts: Ts) -> Result<(), String> {
+    fn finalise_txn(&self, msg: &messages::FinaliseRequest) -> Result<(), String> {
         {
-            let (_latch, txn_record) = self.assert_txn_record(start_ts);
-            assert!(txn_record.commit_state == TxnState::Local);
+            let (_latch, txn_record) = match self.get_txn_record(msg.id) {
+                Some(tup) => tup,
+                None => {
+                    self.fail(msg, format!("Missing txn record"));
+                    return Ok(());
+                }
+            };
+            assert_eq!(
+                txn_record.commit_state,
+                TxnState::Local,
+                "re-finalising? {:?}",
+                msg.id
+            );
             txn_record.commit_state = TxnState::Consensus;
 
             // Commit each key write, remove the lock.
             for (&k, &s) in &txn_record.keys {
                 assert!(
                     s == TxnState::Consensus,
-                    "no consensus for key {:?}, start ts {:?}",
+                    "no consensus for key {:?}, txn {:?}",
                     k,
-                    start_ts,
+                    msg.id,
                 );
                 let _latch = latch::block_on_latch(&self.latches, k)?;
                 let record = self.assert_record(k);
-                // eprintln!("unlock {:?} {:?}", k, start_ts);
+                // eprintln!("unlock {:?} {:?}", k, msg.id);
                 if let Some(lock) = record.lock.as_ref() {
-                    assert!(lock.start_ts == start_ts);
+                    assert!(lock.id == msg.id);
                     let lock_kind = record.lock.as_ref().unwrap().kind;
                     record.lock = None;
 
@@ -353,28 +389,29 @@ impl Server {
                     if lock_kind == LockKind::Modify {
                         record
                             .writes
-                            .insert(0, (txn_record.commit_ts.unwrap(), start_ts));
+                            .insert(0, (txn_record.commit_ts.unwrap(), txn_record.start_ts));
                     }
                 }
             }
         }
 
         // Remove the txn record to conclude the transaction.
-        self.remove_txn_record(start_ts);
+        self.remove_txn_record(msg.id);
         Ok(())
     }
 
     fn rollback_txn(&self, msg: &messages::RollbackRequest) -> Result<(), String> {
         for &k in &msg.keys {
             let _latch = latch::block_on_latch(&self.latches, k)?;
-            let record = self.assert_record(k);
-            if let Some(lock) = record.lock.as_ref() {
-                if lock.start_ts == msg.start_ts {
-                    record.lock = None;
+            if let Some(record) = self.get_record(k) {
+                if let Some(lock) = record.lock.as_ref() {
+                    if lock.id == msg.id {
+                        record.lock = None;
+                    }
                 }
             }
         }
-        self.remove_txn_record(msg.start_ts);
+        self.remove_txn_record(msg.id);
         // TODO ack?
         Ok(())
     }
@@ -422,8 +459,6 @@ impl transport::Receiver for Server {
     }
 }
 
-struct Cluster {}
-
 #[derive(Default, Clone)]
 struct Record {
     values: HashMap<Ts, Value>,
@@ -441,19 +476,19 @@ struct TxnRecord {
 }
 
 impl TxnRecord {
-    fn new(start_ts: Ts) -> Box<TxnRecord> {
-        Box::new(TxnRecord {
+    fn new(start_ts: Ts) -> TxnRecord {
+        TxnRecord {
             keys: HashMap::new(),
             commit_state: TxnState::Local,
             commit_ts: None,
             start_ts,
-        })
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 struct Lock {
-    start_ts: Ts,
+    id: TxnId,
     state: TxnState,
     kind: LockKind,
 }
@@ -462,7 +497,7 @@ struct Lock {
 enum TxnState {
     Local,
     Consensus,
-    Failed,
+    // Failed,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
