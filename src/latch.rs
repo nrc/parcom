@@ -8,12 +8,12 @@ pub struct Latch<'a, T: Eq + Hash> {
 pub fn block_on_latch<'a, T: Copy + Eq + Hash + fmt::Debug>(
     latches: &'a Mutex<HashSet<T>>,
     key: T,
-) -> Latch<'a, T> {
-    eprintln!("Latch {:?}", key);
+) -> Result<Latch<'a, T>, String> {
+    // eprintln!("Latch {:?}", key);
     let mut sleep_count = 100;
     loop {
         if sleep_count == 0 {
-            panic!("Timed out waiting for latch {:?}", key);
+            return Err(format!("Timed out waiting for latch {:?}", key));
         }
         {
             let mut latches = latches.lock().unwrap();
@@ -26,7 +26,7 @@ pub fn block_on_latch<'a, T: Copy + Eq + Hash + fmt::Debug>(
         sleep_count -= 1;
     }
 
-    Latch { key, latches }
+    Ok(Latch { key, latches })
 }
 
 impl<'a, T: Eq + Hash> Drop for Latch<'a, T> {

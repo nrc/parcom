@@ -26,7 +26,7 @@ mod transport;
 
 const READS_PER_TXN: usize = 3;
 const WRITES_PER_TXN: usize = 3;
-const TXNS: usize = 3;
+const TXNS: usize = 10;
 const MAX_KEY: u64 = 1000;
 const MIN_CONSENSUS_TIME: u64 = 10;
 const MAX_CONSENSUS_TIME: u64 = 100;
@@ -70,9 +70,7 @@ pub fn start() {
     let j2 = recv2.listen();
 
     for _ in 0..TXNS {
-        if let Err(_) = client.exec_txn() {
-            return;
-        }
+        client.exec_txn();
     }
 
     // FIXME this is a hack, better to wait for all operations to complete before starting shutdown.

@@ -1,14 +1,20 @@
 use crate::messages::Shutdown;
 use std::{
-    any,
-    sync::{mpsc, Arc},
+    any, mem,
+    sync::{mpsc, Arc, Condvar, Mutex},
     thread,
 };
 
 pub fn new<T: Receiver>() -> (TransportSend, TransportRecv<T>) {
     let (send, recv) = mpsc::channel();
+    let queue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    let resender = Resender {
+        queue: queue.clone(),
+        channel: send,
+    };
+    thread::spawn(move || resender.start());
     (
-        TransportSend { channel: send },
+        TransportSend { queue },
         TransportRecv {
             channel: recv,
             recv: None,
@@ -18,7 +24,7 @@ pub fn new<T: Receiver>() -> (TransportSend, TransportRecv<T>) {
 
 #[derive(Debug, Clone)]
 pub struct TransportSend {
-    channel: mpsc::Sender<Box<dyn any::Any + Send>>,
+    queue: Arc<(Mutex<Vec<Box<dyn any::Any + Send>>>, Condvar)>,
 }
 
 pub struct TransportRecv<T: Receiver> {
@@ -26,22 +32,42 @@ pub struct TransportRecv<T: Receiver> {
     recv: Option<Arc<T>>,
 }
 
+#[derive(Clone)]
+struct Resender {
+    channel: mpsc::Sender<Box<dyn any::Any + Send>>,
+    queue: Arc<(Mutex<Vec<Box<dyn any::Any + Send>>>, Condvar)>,
+}
+
 impl TransportSend {
-    pub fn send(&self, msg: Box<dyn any::Any + Send>) -> Result<(), String> {
-        eprintln!("sending");
-        let result = self
-            .channel
-            .send(msg)
-            .map_err(|e| format!("Sending message failed: {}", e));
-        eprintln!("sent");
-        result
+    pub fn send(&self, msg: Box<dyn any::Any + Send>) {
+        self.queue.0.lock().unwrap().push(msg);
+        self.queue.1.notify_one();
     }
 
     pub fn shutdown(&self) {
-        self.channel
-            .send(Box::new(Shutdown))
-            .map_err(|e| format!("Sending shutdown message failed: {}", e))
-            .unwrap();
+        self.queue.0.lock().unwrap().push(Box::new(Shutdown));
+        self.queue.1.notify_one();
+    }
+}
+
+impl Resender {
+    fn start(&self) {
+        loop {
+            let queue = {
+                let mut queue_guard = self.queue.0.lock().unwrap();
+                mem::take(&mut *queue_guard)
+            };
+
+            for msg in queue {
+                self.channel
+                    .send(msg)
+                    .map_err(|e| format!("Sending message failed: {}", e))
+                    .unwrap();
+            }
+
+            let queue_guard = self.queue.0.lock().unwrap();
+            let _ = self.queue.1.wait(queue_guard).unwrap();
+        }
     }
 }
 

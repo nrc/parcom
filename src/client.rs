@@ -28,7 +28,7 @@ impl Client {
         self.transport.shutdown();
     }
 
-    pub fn exec_txn(&self) -> Result<(), String> {
+    pub fn exec_txn(&self) {
         let start_ts = self.tso.ts();
 
         {
@@ -40,18 +40,17 @@ impl Client {
             };
 
             for _ in 0..READS_PER_TXN {
-                let key = self.exec_lock(start_ts)?;
+                let key = self.exec_lock(start_ts);
                 txn.locks.push((key, false));
             }
-            let keys = self.exec_prewrite(start_ts)?;
+            let keys = self.exec_prewrite(start_ts);
             txn.prewrite = Some((keys, false));
         }
         // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
         // TODO block waiting for responses.
-        Ok(())
     }
 
-    fn exec_lock(&self, start_ts: Ts) -> Result<Key, String> {
+    fn exec_lock(&self, start_ts: Ts) -> Key {
         let key = random_key();
         // eprintln!("lock {:?}", key);
         let msg = messages::LockRequest {
@@ -59,13 +58,11 @@ impl Client {
             start_ts,
             for_update_ts: self.tso.ts(),
         };
-        self.transport
-            .send(Box::new(msg))
-            .map_err(|e| e.to_string())
-            .map(|_| key)
+        self.transport.send(Box::new(msg));
+        key
     }
 
-    fn exec_prewrite(&self, start_ts: Ts) -> Result<Vec<Key>, String> {
+    fn exec_prewrite(&self, start_ts: Ts) -> Vec<Key> {
         let writes: Vec<_> = (0..WRITES_PER_TXN)
             .map(|_| (random_key(), random_value()))
             .collect();
@@ -76,23 +73,20 @@ impl Client {
             commit_ts: self.tso.ts(),
             writes,
         };
-        self.transport
-            .send(Box::new(msg))
-            .map_err(|e| e.to_string())
-            .map(|_| keys)
+        self.transport.send(Box::new(msg));
+        keys
     }
 
-    fn handle_prewrite_response(&self, msg: Box<messages::PrewriteResponse>) -> Result<(), String> {
+    fn handle_prewrite_response(&self, msg: Box<messages::PrewriteResponse>) {
         // TODO retry if no success
         if !msg.success {
             return self.rollback(msg.start_ts);
         }
         self.assert_txn(msg.start_ts).1.prewrite.as_mut().unwrap().1 = true;
-        self.check_responses_and_commit(msg.start_ts)?;
-        Ok(())
+        self.check_responses_and_commit(msg.start_ts);
     }
 
-    fn handle_lock_response(&self, msg: Box<messages::LockResponse>) -> Result<(), String> {
+    fn handle_lock_response(&self, msg: Box<messages::LockResponse>) {
         // TODO retry if no success
         if !msg.success {
             return self.rollback(msg.start_ts);
@@ -105,44 +99,43 @@ impl Client {
                 }
             }
         }
-        self.check_responses_and_commit(msg.start_ts)?;
-        Ok(())
+        self.check_responses_and_commit(msg.start_ts);
     }
 
-    fn check_responses_and_commit(&self, start_ts: Ts) -> Result<(), String> {
+    fn check_responses_and_commit(&self, start_ts: Ts) {
         if !self.assert_txn(start_ts).1.complete() {
-            return Ok(());
+            return;
         }
 
         let msg = messages::FinaliseRequest { start_ts };
-        self.transport
-            .send(Box::new(msg))
-            .map_err(|e| e.to_string())
+        self.transport.send(Box::new(msg));
     }
 
-    fn rollback(&self, start_ts: Ts) -> Result<(), String> {
+    fn rollback(&self, start_ts: Ts) {
         let (_latch, txn) = self.assert_txn(start_ts);
         assert!(!txn.complete());
         let msg = messages::RollbackRequest {
             start_ts,
             keys: txn.keys(),
         };
-        self.transport
-            .send(Box::new(msg))
-            .map_err(|e| e.to_string())
+        self.transport.send(Box::new(msg));
     }
 
     fn assert_txn<'a>(&'a self, start_ts: Ts) -> (latch::Latch<'a, Ts>, &mut Txn) {
-        let latch = latch::block_on_latch(&self.txn_latches, start_ts);
-        let txn = unsafe {
-            self.txns
-                .get()
-                .as_mut()
-                .unwrap()
-                .get_mut(&start_ts)
-                .unwrap()
-        };
-        (latch, txn)
+        loop {
+            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, start_ts) {
+                let txn = unsafe {
+                    self.txns
+                        .get()
+                        .as_mut()
+                        .unwrap()
+                        .get_mut(&start_ts)
+                        .unwrap()
+                };
+                return (latch, txn);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -162,11 +155,17 @@ impl transport::Receiver for Client {
             Err(msg) => msg,
         };
         let msg = match msg.downcast() {
-            Ok(msg) => return self.handle_lock_response(msg),
+            Ok(msg) => {
+                self.handle_lock_response(msg);
+                return Ok(());
+            }
             Err(msg) => msg,
         };
         let msg = match msg.downcast() {
-            Ok(msg) => return self.handle_prewrite_response(msg),
+            Ok(msg) => {
+                self.handle_prewrite_response(msg);
+                return Ok(());
+            }
             Err(msg) => msg,
         };
         Err(format!("Unknown message type: {:?}", msg.type_id()))
