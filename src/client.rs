@@ -3,6 +3,7 @@ use rand::{self, Rng};
 use std::{any, cell::UnsafeCell, sync::Mutex};
 
 pub struct Client {
+    // TODO use server::store! here
     txns: UnsafeCell<Box<[Option<Txn>; TXNS]>>,
     txn_latches: Mutex<Box<[bool; TXNS]>>,
     tso: Tso,

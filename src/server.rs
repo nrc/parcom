@@ -16,10 +16,8 @@ use std::{
 pub struct Server {
     // We use txn records indexed by start TS, rather than storing this info on the primary lock.
     // The two approaches are equivalent.
-    txns: UnsafeCell<Box<[Option<TxnRecord>; TXNS]>>,
-    keys: UnsafeCell<Box<[Option<Record>; MAX_KEY]>>,
-    latches: Mutex<Box<[bool; MAX_KEY]>>,
-    txn_latches: Mutex<Box<[bool; TXNS]>>,
+    txns: TxnStore,
+    keys: KvStore,
     transport: transport::TransportSend,
     thread_count: AtomicU64,
 }
@@ -28,19 +26,22 @@ impl Server {
     pub fn new(transport: transport::TransportSend) -> Server {
         Server {
             transport,
-            txns: UnsafeCell::new(Box::new([None; TXNS])),
-            keys: UnsafeCell::new(Box::new([None; MAX_KEY])),
-            latches: Mutex::new(Box::new([false; MAX_KEY])),
-            txn_latches: Mutex::new(Box::new([false; TXNS])),
+            txns: TxnStore::new(),
+            keys: KvStore::new(),
             thread_count: AtomicU64::new(0),
         }
     }
 
     pub fn shutdown(&self) {
-        assert!(self.latches.lock().unwrap().is_empty());
+        assert!(self.txns.latches.lock().unwrap().is_empty());
+        assert!(self.keys.latches.lock().unwrap().is_empty());
         unsafe {
-            println!("shutdown, len {}", self.keys.get().as_mut().unwrap().len());
+            println!(
+                "shutdown, len {}",
+                self.keys.entries.get().as_mut().unwrap().len()
+            );
             self.keys
+                .entries
                 .get()
                 .as_mut()
                 .unwrap()
@@ -57,7 +58,7 @@ impl Server {
             // TODO record writes or locks or both?
             if self.txn_contains_key(msg.id, msg.key, msg.start_ts) {
                 // Check we have locked this key.
-                let record = self.record(msg.key);
+                let (_latch, record) = self.keys.get_or_else(msg.key, Record::default);
                 assert_eq!(record.lock.as_ref().expect("Missing lock").id, msg.id);
             } else {
                 if let Err(s) = self.aquire_lock_and_set_value(msg.key, msg.id, msg.start_ts, None)
@@ -65,7 +66,9 @@ impl Server {
                     self.fail(&*msg, s);
                     return;
                 }
-                let (_latch, txn_record) = self.txn_record(msg.id, msg.start_ts);
+                let (_latch, txn_record) = self
+                    .txns
+                    .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
                 assert_eq!(msg.start_ts, txn_record.start_ts);
                 txn_record.keys.insert(msg.key, TxnState::Local);
             }
@@ -82,7 +85,7 @@ impl Server {
             // eprintln!("prewrite key {:?} {:?}", msg.id, k);
             if self.txn_contains_key(msg.id, k, msg.start_ts) {
                 // Key is already locked, just need to write the value.
-                let record = self.record(k);
+                let (_latch, record) = self.keys.get_or_else(k, Record::default);
                 assert!(record.lock.as_ref().unwrap().id == msg.id);
                 record.values.insert(msg.start_ts, v);
             } else {
@@ -95,14 +98,18 @@ impl Server {
                     self.fail(&*msg, s);
                     return;
                 }
-                let (_latch, txn_record) = self.txn_record(msg.id, msg.start_ts);
+                let (_latch, txn_record) = self
+                    .txns
+                    .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
                 txn_record.keys.insert(k, TxnState::Local);
                 locked.push(k);
             }
         }
 
         {
-            let (_latch, txn_record) = self.txn_record(msg.id, msg.start_ts);
+            let (_latch, txn_record) = self
+                .txns
+                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
             txn_record.commit_ts = Some(msg.commit_ts);
         }
 
@@ -134,139 +141,38 @@ impl Server {
         start_ts: Ts,
         value: Option<Value>,
     ) -> Result<(), String> {
-        loop {
-            if let Ok(_latch) = latch::block_on_latch(&self.latches, key) {
-                // eprintln!("aquired latch, getting record {:?}", key);
-                let record = self.record(key);
-                // eprintln!("got record {:?}", key);
+        let (_latch, record) = self.keys.get_or_else(key, Record::default);
 
-                return if record.lock.is_none() {
-                    let lock_kind = if let Some(v) = value {
-                        let exists = record.values.insert(start_ts, v);
-                        assert!(exists.is_none());
-                        LockKind::Modify
-                    } else {
-                        LockKind::Read
-                    };
-                    record.lock = Some(Lock {
-                        id,
-                        state: TxnState::Local,
-                        kind: lock_kind,
-                    });
+        if record.lock.is_none() {
+            let lock_kind = if let Some(v) = value {
+                let exists = record.values.insert(start_ts, v);
+                assert!(exists.is_none());
+                LockKind::Modify
+            } else {
+                LockKind::Read
+            };
+            record.lock = Some(Lock {
+                id,
+                state: TxnState::Local,
+                kind: lock_kind,
+            });
 
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "Key locked {:?} by {:?}",
-                        key,
-                        record.lock.as_ref().unwrap().id
-                    ))
-                };
-            }
-            thread::sleep(Duration::from_millis(50));
+            Ok(())
+        } else {
+            Err(format!(
+                "Key locked {:?} by {:?}",
+                key,
+                record.lock.as_ref().unwrap().id
+            ))
         }
-    }
-
-    fn record(&self, key: Key) -> &mut Record {
-        let map = unsafe { self.keys.get().as_mut().unwrap() };
-        let key: usize = key.into();
-        match map[key] {
-            Some(ref mut r) => r,
-            None => {
-                map[key] = Some(Record::default());
-                map[key].as_mut().unwrap()
-            }
-        }
-    }
-
-    fn assert_record(&self, key: Key) -> &mut Record {
-        self.get_record(key)
-            .expect(&format!("assert_record failed {:?}", key))
-    }
-
-    fn get_record(&self, key: Key) -> Option<&mut Record> {
-        unsafe { self.keys.get().as_mut().unwrap()[key.into(): usize].as_mut() }
-    }
-
-    // The caller should not hold any latches when calling this function.
-    fn txn_record<'a>(
-        &'a self,
-        id: TxnId,
-        start_ts: Ts,
-    ) -> (latch::Latch<'a, { TXNS }>, &mut TxnRecord) {
-        loop {
-            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, id) {
-                let id: usize = id.into();
-                unsafe {
-                    let map = self.txns.get().as_mut().unwrap();
-                    if let Some(ref mut txn_record) = map[id] {
-                        return (latch, txn_record);
-                    }
-                    map[id] = Some(TxnRecord::new(start_ts));
-                    return (latch, map[id].as_mut().unwrap());
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn txn_contains_key(&self, id: TxnId, key: Key, start_ts: Ts) -> bool {
-        let (_latch, record) = self.txn_record(id, start_ts);
-        record.keys.contains_key(&key)
-    }
-
-    // The caller should not hold any latches when calling this function.
-    fn get_txn_record<'a>(
-        &'a self,
-        id: TxnId,
-    ) -> Option<(latch::Latch<'a, { TXNS }>, &mut TxnRecord)> {
-        loop {
-            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, id) {
-                return unsafe {
-                    self.txns.get().as_mut().unwrap()[id.into(): usize]
-                        .as_mut()
-                        .map(|record| (latch, record))
-                };
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn remove_txn_record(&self, id: TxnId) {
-        loop {
-            if let Ok(_latch) = latch::block_on_latch(&self.txn_latches, id) {
-                unsafe {
-                    self.txns.get().as_mut().unwrap()[id.into(): usize] = None;
-                }
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    fn ack<T: MsgRequest>(&self, msg: &T) {
-        let msg = msg.ack();
-        self.transport.send(Box::new(msg));
-    }
-
-    fn fail<T: MsgRequest + fmt::Debug>(&self, msg: &T, s: String) {
-        println!("Message handling failed {:?}: {}", msg, s);
-        let msg = msg.response(false);
-        self.transport.send(Box::new(msg));
-    }
-
-    fn respond<T: MsgRequest>(&self, msg: &T) {
-        let msg = msg.response(true);
-        self.transport.send(Box::new(msg));
     }
 
     fn abort_prewrite(&self, id: TxnId, locked: &[Key]) -> Result<(), String> {
         // Unlock any keys we previously locked.
-        let (_latch, txn_record) = self.get_txn_record(id).unwrap();
+        let (_latch, txn_record) = self.txns.blocking_get(id).unwrap();
         for &k in locked {
             txn_record.keys.remove(&k);
-            let _latch = latch::block_on_latch(&self.latches, k)?;
-            let record = self.assert_record(k);
+            let (_latch, record) = self.keys.try_get(k)?.unwrap();
             if let Some(lock) = record.lock.as_ref() {
                 if lock.id == id {
                     record.lock = None;
@@ -284,19 +190,12 @@ impl Server {
     }
 
     fn update_lock_state(&self, key: Key, id: TxnId) -> Result<(), String> {
-        let (_latch, txn_record) = match self.get_txn_record(id) {
+        let (_latch, txn_record) = match self.txns.blocking_get(id) {
             Some(tup) => tup,
             None => return Err(format!("Transaction {:?} missing {:?}", id, key)),
         };
         {
-            let _latch = loop {
-                if let Ok(latch) = latch::block_on_latch(&self.latches, key) {
-                    break latch;
-                }
-                thread::sleep(Duration::from_millis(50));
-            };
-
-            let record = self.assert_record(key);
+            let (_latch, record) = self.keys.blocking_get(key).unwrap();
             match &mut record.lock {
                 Some(lock) if lock.id == id => lock.state = TxnState::Consensus,
                 _ => {
@@ -351,7 +250,7 @@ impl Server {
 
     fn finalise_txn(&self, msg: &messages::FinaliseRequest) -> Result<(), String> {
         {
-            let (_latch, txn_record) = match self.get_txn_record(msg.id) {
+            let (_latch, txn_record) = match self.txns.blocking_get(msg.id) {
                 Some(tup) => tup,
                 None => {
                     self.fail(msg, format!("Missing txn record"));
@@ -374,8 +273,7 @@ impl Server {
                     k,
                     msg.id,
                 );
-                let _latch = latch::block_on_latch(&self.latches, k)?;
-                let record = self.assert_record(k);
+                let (_latch, record) = self.keys.try_get(k)?.unwrap();
                 // eprintln!("unlock {:?} {:?}", k, msg.id);
                 if let Some(lock) = record.lock.as_ref() {
                     assert!(lock.id == msg.id);
@@ -396,14 +294,13 @@ impl Server {
         }
 
         // Remove the txn record to conclude the transaction.
-        self.remove_txn_record(msg.id);
+        self.txns.remove(msg.id);
         Ok(())
     }
 
     fn rollback_txn(&self, msg: &messages::RollbackRequest) -> Result<(), String> {
         for &k in &msg.keys {
-            let _latch = latch::block_on_latch(&self.latches, k)?;
-            if let Some(record) = self.get_record(k) {
+            if let Some((_latch, record)) = self.keys.try_get(k)? {
                 if let Some(lock) = record.lock.as_ref() {
                     if lock.id == msg.id {
                         record.lock = None;
@@ -411,13 +308,32 @@ impl Server {
                 }
             }
         }
-        self.remove_txn_record(msg.id);
+        self.txns.remove(msg.id);
         // TODO ack?
         Ok(())
     }
-}
 
-unsafe impl Sync for Server {}
+    fn ack<T: MsgRequest>(&self, msg: &T) {
+        let msg = msg.ack();
+        self.transport.send(Box::new(msg));
+    }
+
+    fn fail<T: MsgRequest + fmt::Debug>(&self, msg: &T, s: String) {
+        println!("Message handling failed {:?}: {}", msg, s);
+        let msg = msg.response(false);
+        self.transport.send(Box::new(msg));
+    }
+
+    fn respond<T: MsgRequest>(&self, msg: &T) {
+        let msg = msg.response(true);
+        self.transport.send(Box::new(msg));
+    }
+
+    fn txn_contains_key(&self, id: TxnId, key: Key, start_ts: Ts) -> bool {
+        let (_latch, record) = self.txns.get_or_else(id, || TxnRecord::new(start_ts));
+        record.keys.contains_key(&key)
+    }
+}
 
 impl transport::Receiver for Server {
     fn recv_msg(self: Arc<Self>, mut msg: Box<dyn any::Any + Send>) -> Result<(), String> {
@@ -458,6 +374,95 @@ impl transport::Receiver for Server {
         Ok(())
     }
 }
+
+macro_rules! store {
+    ($name: ident, $T: ty, $Id: ty, $size: ident) => {
+        struct $name {
+            entries: UnsafeCell<Box<[Option<$T>; $size]>>,
+            latches: Mutex<Box<[bool; $size]>>,
+        }
+
+        #[allow(dead_code)]
+        impl $name {
+            fn new() -> $name {
+                $name {
+                    entries: UnsafeCell::new(Box::new([None; $size])),
+                    latches: Mutex::new(Box::new([false; $size])),
+                }
+            }
+
+            // The caller should not hold any latches when calling this function.
+            fn get_or_else<'a, F>(
+                &'a self,
+                id: $Id,
+                or_else: F,
+            ) -> (latch::Latch<'a, $size>, &mut $T)
+            where
+                F: FnOnce() -> $T,
+            {
+                loop {
+                    if let Ok(latch) = latch::block_on_latch(&self.latches, id) {
+                        let id: usize = id.into();
+                        unsafe {
+                            let map = self.entries.get().as_mut().unwrap();
+                            if let Some(ref mut entry) = map[id] {
+                                return (latch, entry);
+                            }
+                            map[id] = Some(or_else());
+                            return (latch, map[id].as_mut().unwrap());
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            // The caller should not hold any latches when calling this function.
+            fn try_get<'a>(
+                &'a self,
+                id: $Id,
+            ) -> Result<Option<(latch::Latch<'a, $size>, &mut $T)>, String> {
+                latch::block_on_latch(&self.latches, id).map(|latch| {
+                    return unsafe {
+                        self.entries.get().as_mut().unwrap()[id.into(): usize]
+                            .as_mut()
+                            .map(|record| (latch, record))
+                    };
+                })
+            }
+
+            // The caller should not hold any latches when calling this function.
+            fn blocking_get<'a>(&'a self, id: $Id) -> Option<(latch::Latch<'a, $size>, &mut $T)> {
+                loop {
+                    if let Ok(latch) = latch::block_on_latch(&self.latches, id) {
+                        return unsafe {
+                            self.entries.get().as_mut().unwrap()[id.into(): usize]
+                                .as_mut()
+                                .map(|record| (latch, record))
+                        };
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            fn remove(&self, id: $Id) {
+                loop {
+                    if let Ok(_latch) = latch::block_on_latch(&self.latches, id) {
+                        unsafe {
+                            self.entries.get().as_mut().unwrap()[id.into(): usize] = None;
+                        }
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        unsafe impl Sync for $name {}
+    };
+}
+
+store!(TxnStore, TxnRecord, TxnId, TXNS);
+store!(KvStore, Record, Key, MAX_KEY);
 
 #[derive(Default, Clone)]
 struct Record {
