@@ -79,8 +79,8 @@ impl<T: Receiver + 'static> TransportRecv<T> {
             let msg = self.channel.recv().map_err(|e| e.to_string());
             if let Ok(msg) = &msg {
                 if msg.is::<Shutdown>() {
-                    eprintln!("listener shutting down normally");
                     self.recv.clone().unwrap().handle_shutdown().unwrap();
+                    eprintln!("listener shutting down normally");
                     return;
                 }
             }

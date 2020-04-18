@@ -33,20 +33,13 @@ impl Server {
     }
 
     pub fn shutdown(&self) {
-        assert!(self.txns.latches.lock().unwrap().is_empty());
-        assert!(self.keys.latches.lock().unwrap().is_empty());
-        unsafe {
-            println!(
-                "shutdown, len {}",
-                self.keys.entries.get().as_mut().unwrap().len()
-            );
-            self.keys
-                .entries
-                .get()
-                .as_mut()
-                .unwrap()
-                .iter()
-                .for_each(|k| assert!(k.is_none() || k.as_ref().unwrap().lock.is_none()));
+        assert!(self.txns.unlocked());
+        assert!(self.keys.unlocked());
+
+        for k in 0..MAX_KEY {
+            if let Some((_latch, record)) = self.keys.blocking_get(Key(k)) {
+                assert!(record.lock.is_none(), "Key({:?}) locked", k)
+            }
         }
 
         self.transport.shutdown();
@@ -54,6 +47,14 @@ impl Server {
 
     fn handle_lock(&self, msg: Box<messages::LockRequest>) {
         // eprintln!("lock {:?} {:?}", msg.key, msg.id);
+        {
+            let (_latch, txn_record) = self
+                .txns
+                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
+            if txn_record.commit_state == TxnState::RolledBack {
+                return;
+            }
+        }
         {
             // TODO record writes or locks or both?
             if self.txn_contains_key(msg.id, msg.key, msg.start_ts) {
@@ -66,9 +67,7 @@ impl Server {
                     self.fail(&*msg, s);
                     return;
                 }
-                let (_latch, txn_record) = self
-                    .txns
-                    .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
+                let (_latch, txn_record) = self.txns.blocking_get(msg.id).unwrap();
                 assert_eq!(msg.start_ts, txn_record.start_ts);
                 txn_record.keys.insert(msg.key, TxnState::Local);
             }
@@ -80,6 +79,14 @@ impl Server {
 
     fn handle_prewrite(&self, msg: Box<messages::PrewriteRequest>) {
         // eprintln!("prewrite {:?} {:?}", msg.id, msg.writes);
+        {
+            let (_latch, txn_record) = self
+                .txns
+                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
+            if txn_record.commit_state == TxnState::RolledBack {
+                return;
+            }
+        }
         let mut locked = Vec::new();
         for &(k, v) in &msg.writes {
             // eprintln!("prewrite key {:?} {:?}", msg.id, k);
@@ -98,9 +105,7 @@ impl Server {
                     self.fail(&*msg, s);
                     return;
                 }
-                let (_latch, txn_record) = self
-                    .txns
-                    .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
+                let (_latch, txn_record) = self.txns.blocking_get(msg.id).unwrap();
                 txn_record.keys.insert(k, TxnState::Local);
                 locked.push(k);
             }
@@ -220,9 +225,6 @@ impl Server {
         match self.update_lock_state(msg.key, msg.id) {
             Ok(_) => {
                 // eprintln!("consensus lock complete {:?} {:?}", msg.id, msg.key);
-
-                // We could check all keys and set the record lock state.
-
                 self.respond(msg);
             }
             Err(s) => self.fail(msg, s),
@@ -235,7 +237,7 @@ impl Server {
 
         for &(k, _) in &msg.writes {
             if let Err(s) = self.update_lock_state(k, msg.id) {
-                // Leaves locks messed up, but that should get sorted out when we rollback.
+                // Leaves keys locked without a txn, but that should get sorted out when we rollback.
                 self.fail(msg, s);
                 return;
             }
@@ -300,32 +302,40 @@ impl Server {
 
     fn rollback_txn(&self, msg: &messages::RollbackRequest) -> Result<(), String> {
         for &k in &msg.keys {
+            eprintln!("rollback {:?}", k);
             if let Some((_latch, record)) = self.keys.try_get(k)? {
+                eprintln!("lock {:?}", record.lock);
                 if let Some(lock) = record.lock.as_ref() {
                     if lock.id == msg.id {
+                        eprintln!("unlock {:?}", k);
                         record.lock = None;
                     }
                 }
             }
         }
-        self.txns.remove(msg.id);
+        // Don't remove because we want a record that the txn is rolled vack
+        //self.txns.remove(msg.id);
+        // FIXME if we get a rollback without any locks/prewrites, then the unwrap is bogus.
+        let (_latch, record) = self.txns.blocking_get(msg.id).unwrap();
+        record.commit_state = TxnState::RolledBack;
         // TODO ack?
         Ok(())
     }
 
     fn ack<T: MsgRequest>(&self, msg: &T) {
-        let msg = msg.ack();
+        let msg = msg.ack().unwrap();
         self.transport.send(Box::new(msg));
     }
 
     fn fail<T: MsgRequest + fmt::Debug>(&self, msg: &T, s: String) {
         println!("Message handling failed {:?}: {}", msg, s);
-        let msg = msg.response(false);
-        self.transport.send(Box::new(msg));
+        if let Some(msg) = msg.response(false) {
+            self.transport.send(Box::new(msg));
+        }
     }
 
     fn respond<T: MsgRequest>(&self, msg: &T) {
-        let msg = msg.response(true);
+        let msg = msg.response(true).unwrap();
         self.transport.send(Box::new(msg));
     }
 
@@ -389,6 +399,16 @@ macro_rules! store {
                     entries: UnsafeCell::new(Box::new([None; $size])),
                     latches: Mutex::new(Box::new([false; $size])),
                 }
+            }
+
+            fn unlocked(&self) -> bool {
+                let latches = self.latches.lock().unwrap();
+                for &l in &**latches as &[bool] {
+                    if l {
+                        return false;
+                    }
+                }
+                true
             }
 
             // The caller should not hold any latches when calling this function.
@@ -502,7 +522,7 @@ struct Lock {
 enum TxnState {
     Local,
     Consensus,
-    // Failed,
+    RolledBack,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

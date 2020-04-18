@@ -66,7 +66,7 @@ impl Tso {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct Key(usize);
+pub struct Key(pub usize);
 #[derive(Debug, Copy, Clone, Default)]
 pub struct Value(usize);
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -101,9 +101,7 @@ pub fn start() {
         client.exec_txn();
     }
 
-    // FIXME this is a hack, better to wait for all operations to complete before starting shutdown.
-    thread::sleep(Duration::from_millis(1000000));
-
+    println!("Begin shutdown");
     client.shutdown();
     j2.join().unwrap();
     server.shutdown();

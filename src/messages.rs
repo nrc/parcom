@@ -4,8 +4,12 @@ pub trait MsgRequest {
     type Response: Send + 'static;
     type Ack: Send + 'static;
 
-    fn ack(&self) -> Self::Ack;
-    fn response(&self, success: bool) -> Self::Response;
+    fn ack(&self) -> Option<Self::Ack> {
+        None
+    }
+    fn response(&self, _success: bool) -> Option<Self::Response> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -20,19 +24,19 @@ impl MsgRequest for LockRequest {
     type Response = LockResponse;
     type Ack = LockAck;
 
-    fn ack(&self) -> LockAck {
-        LockAck {
+    fn ack(&self) -> Option<LockAck> {
+        Some(LockAck {
             key: self.key,
             id: self.id,
-        }
+        })
     }
 
-    fn response(&self, success: bool) -> LockResponse {
-        LockResponse {
+    fn response(&self, success: bool) -> Option<LockResponse> {
+        Some(LockResponse {
             key: self.key,
             id: self.id,
             success,
-        }
+        })
     }
 }
 
@@ -62,15 +66,15 @@ impl MsgRequest for PrewriteRequest {
     type Response = PrewriteResponse;
     type Ack = PrewriteAck;
 
-    fn ack(&self) -> PrewriteAck {
-        PrewriteAck { id: self.id }
+    fn ack(&self) -> Option<PrewriteAck> {
+        Some(PrewriteAck { id: self.id })
     }
 
-    fn response(&self, success: bool) -> PrewriteResponse {
-        PrewriteResponse {
+    fn response(&self, success: bool) -> Option<PrewriteResponse> {
+        Some(PrewriteResponse {
             id: self.id,
             success,
-        }
+        })
     }
 }
 
@@ -94,14 +98,6 @@ pub struct FinaliseRequest {
 impl MsgRequest for FinaliseRequest {
     type Response = !;
     type Ack = !;
-
-    fn ack(&self) -> ! {
-        panic!();
-    }
-
-    fn response(&self, _: bool) -> ! {
-        panic!();
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,14 +109,6 @@ pub struct RollbackRequest {
 impl MsgRequest for RollbackRequest {
     type Response = !;
     type Ack = !;
-
-    fn ack(&self) -> ! {
-        panic!();
-    }
-
-    fn response(&self, _: bool) -> ! {
-        panic!();
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -129,12 +117,4 @@ pub struct Shutdown;
 impl MsgRequest for Shutdown {
     type Response = !;
     type Ack = !;
-
-    fn ack(&self) -> ! {
-        panic!();
-    }
-
-    fn response(&self, _: bool) -> ! {
-        panic!();
-    }
 }

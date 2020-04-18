@@ -1,6 +1,13 @@
 use crate::*;
 use rand::{self, Rng};
-use std::{any, cell::UnsafeCell, sync::Mutex};
+use std::{
+    any,
+    cell::UnsafeCell,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
+};
 
 pub struct Client {
     // TODO use server::store! here
@@ -8,6 +15,7 @@ pub struct Client {
     txn_latches: Mutex<Box<[bool; TXNS]>>,
     tso: Tso,
     transport: transport::TransportSend,
+    pending: AtomicUsize,
 }
 
 impl Client {
@@ -17,10 +25,25 @@ impl Client {
             txn_latches: Mutex::new(Box::new([false; TXNS])),
             tso,
             transport,
+            pending: AtomicUsize::new(0),
         }
     }
 
     pub fn shutdown(&self) {
+        let mut sleep_count = 100;
+        while self.pending.load(Ordering::SeqCst) > 0 {
+            if sleep_count == 0 {
+                println!(
+                    "shutdown timed out {} transactions pending",
+                    self.pending.load(Ordering::SeqCst)
+                );
+                break;
+            }
+
+            sleep_count -= 1;
+            thread::sleep(Duration::from_millis(50));
+        }
+
         self.transport.shutdown();
     }
 
@@ -28,23 +51,23 @@ impl Client {
         let start_ts = self.tso.ts();
         let id = self.tso.id();
 
-        {
-            let _latch = latch::block_on_latch(&self.txn_latches, id);
-            let txn: &mut Txn = unsafe {
-                let txns = self.txns.get().as_mut().unwrap();
-                txns[id.into(): usize] = Some(Txn::new());
-                ((&mut txns[id.into(): usize]): &mut Option<Txn>)
-                    .as_mut()
-                    .unwrap()
-            };
+        let _latch = latch::block_on_latch(&self.txn_latches, id);
+        let txn: &mut Txn = unsafe {
+            let txns = self.txns.get().as_mut().unwrap();
+            txns[id.into(): usize] = Some(Txn::new());
+            ((&mut txns[id.into(): usize]): &mut Option<Txn>)
+                .as_mut()
+                .unwrap()
+        };
 
-            for _ in 0..READS_PER_TXN {
-                let key = self.exec_lock(id, start_ts);
-                txn.locks.push((key, false));
-            }
-            let keys = self.exec_prewrite(id, start_ts);
-            txn.prewrite = Some((keys, false));
+        for _ in 0..READS_PER_TXN {
+            let key = self.exec_lock(id, start_ts);
+            txn.locks.push((key, false));
         }
+        let keys = self.exec_prewrite(id, start_ts);
+        txn.prewrite = Some((keys, false));
+        self.pending.fetch_add(1, Ordering::SeqCst);
+
         // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
         // TODO block waiting for responses.
     }
@@ -111,17 +134,25 @@ impl Client {
 
         let msg = messages::FinaliseRequest { id };
         self.transport.send(Box::new(msg));
+        println!("commit {:?}", id);
+        self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn rollback(&self, id: TxnId) {
         let (_latch, txn) = self.assert_txn(id);
+        if txn.rolled_back {
+            return;
+        }
         assert!(!txn.complete());
         txn.rolled_back = true;
+
         let msg = messages::RollbackRequest {
             id,
             keys: txn.keys(),
         };
         self.transport.send(Box::new(msg));
+        println!("rollback {:?}", id);
+        self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn assert_txn<'a>(&'a self, id: TxnId) -> (latch::Latch<'a, { TXNS }>, &mut Txn) {
