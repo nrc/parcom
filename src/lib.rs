@@ -3,7 +3,8 @@
 // recovery
 //   timeouts
 // consensus write after failure
-// for_update_ts
+// retries
+// for_update_ts and partial retries
 // non-locking reads (and the reading part of locking reads)
 // multi-threaded client
 // multiple clients and servers
