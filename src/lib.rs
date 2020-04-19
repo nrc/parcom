@@ -1,14 +1,14 @@
 // TODO
 //
-// multi-threaded client
-// timeouts
-// non-locking reads (and the reading part of locking reads)
 // recovery
-// multiple clients and servers
-// deadlock
+//   timeouts
 // consensus write after failure
 // for_update_ts
-// add a User, check invariants
+// non-locking reads (and the reading part of locking reads)
+// multi-threaded client
+// multiple clients and servers
+// deadlock?
+// add a User, check invariants?
 
 #![allow(incomplete_features)]
 #![feature(const_generics)]

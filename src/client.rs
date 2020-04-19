@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Mutex,
     },
+    time::Instant,
 };
 
 pub struct Client {
@@ -72,6 +73,7 @@ impl Client {
             key,
             start_ts,
             for_update_ts: self.tso.ts(),
+            timeout: Instant::now() + Duration::from_millis(500),
         };
         self.transport.send(Box::new(msg));
         key
@@ -87,6 +89,7 @@ impl Client {
             start_ts,
             commit_ts: self.tso.ts(),
             writes,
+            timeout: Instant::now() + Duration::from_millis(500),
         };
         self.transport.send(Box::new(msg));
         keys

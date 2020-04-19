@@ -1,4 +1,5 @@
 use crate::*;
+use std::time::Instant;
 
 pub trait MsgRequest {
     type Response: Send + 'static;
@@ -17,6 +18,8 @@ pub struct LockRequest {
     pub key: Key,
     pub id: TxnId,
     pub start_ts: Ts,
+    // TODO do we need a timeout here, or just on prewrite?
+    pub timeout: Instant,
     pub for_update_ts: Ts,
 }
 
@@ -59,6 +62,7 @@ pub struct PrewriteRequest {
     pub id: TxnId,
     pub start_ts: Ts,
     pub commit_ts: Ts,
+    pub timeout: Instant,
     pub writes: Vec<(Key, Value)>,
 }
 

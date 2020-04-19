@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub struct Server {
@@ -50,18 +50,19 @@ impl Server {
         {
             let (_latch, txn_record) = self
                 .txns
-                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
+                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts, msg.timeout));
             if txn_record.commit_state == TxnState::RolledBack {
                 return;
             }
         }
         {
             // TODO record writes or locks or both?
-            if self.txn_contains_key(msg.id, msg.key, msg.start_ts) {
+            if self.txn_contains_key(msg.id, msg.key, msg.start_ts, msg.timeout) {
                 // Check we have locked this key.
                 let (_latch, record) = self.keys.get_or_else(msg.key, Record::default);
                 assert_eq!(record.lock.as_ref().expect("Missing lock").id, msg.id);
             } else {
+                // TODO check key as if we were going to read it and perhaps recover.
                 if let Err(s) = self.aquire_lock_and_set_value(msg.key, msg.id, msg.start_ts, None)
                 {
                     self.fail(&*msg, s);
@@ -70,6 +71,9 @@ impl Server {
                 let (_latch, txn_record) = self.txns.blocking_get(msg.id).unwrap();
                 assert_eq!(msg.start_ts, txn_record.start_ts);
                 txn_record.keys.insert(msg.key, TxnState::Local);
+                if txn_record.timeout < msg.timeout {
+                    txn_record.timeout = msg.timeout;
+                }
             }
         }
 
@@ -82,7 +86,7 @@ impl Server {
         {
             let (_latch, txn_record) = self
                 .txns
-                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
+                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts, msg.timeout));
             if txn_record.commit_state == TxnState::RolledBack {
                 return;
             }
@@ -90,7 +94,7 @@ impl Server {
         let mut locked = Vec::new();
         for &(k, v) in &msg.writes {
             // eprintln!("prewrite key {:?} {:?}", msg.id, k);
-            if self.txn_contains_key(msg.id, k, msg.start_ts) {
+            if self.txn_contains_key(msg.id, k, msg.start_ts, msg.timeout) {
                 // Key is already locked, just need to write the value.
                 let (_latch, record) = self.keys.get_or_else(k, Record::default);
                 assert!(record.lock.as_ref().unwrap().id == msg.id);
@@ -114,8 +118,11 @@ impl Server {
         {
             let (_latch, txn_record) = self
                 .txns
-                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts));
+                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts, msg.timeout));
             txn_record.commit_ts = Some(msg.commit_ts);
+            if txn_record.timeout < msg.timeout {
+                txn_record.timeout = msg.timeout;
+            }
         }
 
         self.ack(&*msg);
@@ -336,8 +343,10 @@ impl Server {
         self.transport.send(Box::new(msg));
     }
 
-    fn txn_contains_key(&self, id: TxnId, key: Key, start_ts: Ts) -> bool {
-        let (_latch, record) = self.txns.get_or_else(id, || TxnRecord::new(start_ts));
+    fn txn_contains_key(&self, id: TxnId, key: Key, start_ts: Ts, timeout: Instant) -> bool {
+        let (_latch, record) = self
+            .txns
+            .get_or_else(id, || TxnRecord::new(start_ts, timeout));
         record.keys.contains_key(&key)
     }
 }
@@ -399,15 +408,17 @@ struct TxnRecord {
     commit_state: TxnState,
     commit_ts: Option<Ts>,
     start_ts: Ts,
+    timeout: Instant,
 }
 
 impl TxnRecord {
-    fn new(start_ts: Ts) -> TxnRecord {
+    fn new(start_ts: Ts, timeout: Instant) -> TxnRecord {
         TxnRecord {
             keys: HashMap::new(),
             commit_state: TxnState::Local,
             commit_ts: None,
             start_ts,
+            timeout,
         }
     }
 }
