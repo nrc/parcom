@@ -147,13 +147,13 @@ impl Client {
             return;
         }
         assert!(!txn.complete());
-        txn.rolled_back = true;
 
         let msg = messages::RollbackRequest {
             id,
             keys: txn.keys(),
         };
         self.transport.send(Box::new(msg));
+        txn.rolled_back = true;
         self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 }

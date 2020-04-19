@@ -6,6 +6,7 @@
 // retries
 // for_update_ts and partial retries
 // non-locking reads (and the reading part of locking reads)
+// failures
 // multi-threaded client
 // multiple clients and servers
 // deadlock?
@@ -92,8 +93,8 @@ impl Into<usize> for TxnId {
 
 pub fn start() {
     let tso = Tso::new();
-    let (send1, mut recv1) = transport::new();
-    let (send2, mut recv2) = transport::new();
+    let (send1, mut recv1, handle1) = transport::new();
+    let (send2, mut recv2, handle2) = transport::new();
     let server = Arc::new(server::Server::new(send1));
     let client = Arc::new(client::Client::new(tso.clone(), send2));
     recv1.set_handler(client.clone());
@@ -107,7 +108,9 @@ pub fn start() {
 
     println!("Begin shutdown");
     client.shutdown();
+    handle2.join().unwrap();
     j2.join().unwrap();
     server.shutdown();
     j1.join().unwrap();
+    handle1.join().unwrap();
 }

@@ -1,30 +1,38 @@
 use crate::messages::Shutdown;
 use std::{
     any,
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     thread,
 };
 
-pub fn new<T: Receiver>() -> (TransportSend, TransportRecv<T>) {
+pub fn new<T: Receiver>() -> (TransportSend, TransportRecv<T>, thread::JoinHandle<()>) {
     let (send, recv) = mpsc::channel();
     let queue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
     let resender = Resender {
         queue: queue.clone(),
         channel: send,
     };
-    thread::spawn(move || resender.start());
+    let handle = thread::spawn(move || resender.start());
     (
-        TransportSend { queue },
+        TransportSend {
+            queue,
+            shutdown: AtomicBool::new(false),
+        },
         TransportRecv {
             channel: recv,
             recv: None,
         },
+        handle,
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TransportSend {
     queue: Arc<(Mutex<Vec<Box<dyn any::Any + Send>>>, Condvar)>,
+    shutdown: AtomicBool,
 }
 
 pub struct TransportRecv<T: Receiver> {
@@ -40,14 +48,17 @@ struct Resender {
 
 impl TransportSend {
     pub fn send(&self, msg: Box<dyn any::Any + Send>) {
+        assert!(!self.shutdown.load(Ordering::SeqCst));
         let mut queue = self.queue.0.lock().unwrap();
         queue.push(msg);
         self.queue.1.notify_one();
     }
 
     pub fn shutdown(&self) {
+        assert!(!self.shutdown.load(Ordering::SeqCst));
         let mut queue = self.queue.0.lock().unwrap();
         queue.push(Box::new(Shutdown));
+        self.shutdown.store(true, Ordering::SeqCst);
         self.queue.1.notify_one();
     }
 }
@@ -58,10 +69,14 @@ impl Resender {
             let mut queue = self.queue.0.lock().unwrap();
 
             for msg in queue.drain(..) {
+                let shutdown = msg.is::<Shutdown>();
                 self.channel
                     .send(msg)
                     .map_err(|e| format!("Sending message failed: {}", e))
                     .unwrap();
+                if shutdown {
+                    return;
+                }
             }
 
             let _ = self.queue.1.wait(queue).unwrap();

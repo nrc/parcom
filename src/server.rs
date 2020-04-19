@@ -146,6 +146,7 @@ impl Server {
 
     fn handle_finalise(&self, msg: Box<messages::FinaliseRequest>) {
         // eprintln!("finalise {:?}", msg.id);
+        // TODO should we break out of this after a while?
         while let Err(_) = self.finalise_txn(&msg) {
             thread::sleep(Duration::from_millis(50));
         }
@@ -172,7 +173,23 @@ impl Server {
         start_ts: Ts,
         value: Option<Value>,
     ) -> Result<(), String> {
-        let (_latch, record) = self.keys.get_or_else(key, Record::default);
+        let (_latch, record) = loop {
+            let key_tup = self.keys.get_or_else(key, Record::default);
+
+            {
+                if let Ok(tup) = self.txns.try_get(id) {
+                    let (_latch, txn_record) = tup.unwrap();
+                    // Need to check commit state again since the txn may have been rolled
+                    // back while we waited for the latch.
+                    if txn_record.commit_state == TxnState::RolledBack {
+                        return Err(format!("{:?} already rolled back", id));
+                    }
+                    break key_tup;
+                }
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        };
 
         if record.lock.is_none() {
             let lock_kind = if let Some(v) = value {
@@ -223,7 +240,6 @@ impl Server {
 
     // TODO never returns Err
     fn update_lock_state(&self, key: Key, id: TxnId) -> Result<(), String> {
-        println!("got consensus {:?} {:?}", key, id);
         let (_latch, txn_record) = match self.txns.blocking_get(id) {
             Some(tup) => tup,
             // TODO Should this be possible?
@@ -249,6 +265,7 @@ impl Server {
             None => panic!("Expected key {:?}, found none", key),
         }
 
+        println!("got consensus {:?} {:?}", key, id);
         Ok(())
     }
 
@@ -288,8 +305,8 @@ impl Server {
             let (_latch, txn_record) = match self.txns.blocking_get(msg.id) {
                 Some(tup) => tup,
                 None => {
-                    self.fail(msg, format!("Missing txn record"));
-                    return Ok(());
+                    // TODO panic
+                    panic!("Missing txn record {:?}", msg.id);
                 }
             };
             assert_eq!(
@@ -346,11 +363,6 @@ impl Server {
                 if let Some(lock) = record.lock.as_ref() {
                     if lock.id == msg.id {
                         record.history.push((record.lock.take().unwrap(), false));
-                    } else {
-                        println!(
-                            "  rolling back {:?}, {:?} locked by {:?}",
-                            msg.id, k, lock.id
-                        );
                     }
                 }
             }
