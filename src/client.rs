@@ -154,7 +154,6 @@ impl Client {
             keys: txn.keys(),
         };
         self.transport.send(Box::new(msg));
-        println!("rollback {:?}", id);
         self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 }

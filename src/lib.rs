@@ -32,9 +32,9 @@ mod messages;
 mod server;
 mod transport;
 
-const READS_PER_TXN: usize = 3;
-const WRITES_PER_TXN: usize = 3;
-const TXNS: usize = 10;
+const READS_PER_TXN: usize = 10;
+const WRITES_PER_TXN: usize = 10;
+const TXNS: usize = 100;
 const MAX_KEY: usize = 1000;
 const MIN_CONSENSUS_TIME: u64 = 10;
 const MAX_CONSENSUS_TIME: u64 = 100;

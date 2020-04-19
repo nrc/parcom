@@ -20,6 +20,7 @@ pub struct Server {
     keys: KvStore,
     transport: transport::TransportSend,
     thread_count: AtomicU64,
+    stats: Statistics,
 }
 
 impl Server {
@@ -29,6 +30,7 @@ impl Server {
             txns: TxnStore::new(),
             keys: KvStore::new(),
             thread_count: AtomicU64::new(0),
+            stats: Statistics::new(),
         }
     }
 
@@ -63,8 +65,11 @@ impl Server {
                 assert_eq!(record.lock.as_ref().expect("Missing lock").id, msg.id);
             } else {
                 // TODO check key as if we were going to read it and perhaps recover.
+                // TODO lock before read
+                self.read(msg.key, msg.id);
                 if let Err(s) = self.aquire_lock_and_set_value(msg.key, msg.id, msg.start_ts, None)
                 {
+                    self.stats.failed_rws.fetch_add(1, Ordering::SeqCst);
                     self.fail(&*msg, s);
                     return;
                 }
@@ -106,6 +111,7 @@ impl Server {
                     while let Err(_) = self.abort_prewrite(msg.id, &locked) {
                         thread::sleep(Duration::from_millis(50));
                     }
+                    self.stats.failed_rws.fetch_add(1, Ordering::SeqCst);
                     self.fail(&*msg, s);
                     return;
                 }
@@ -113,6 +119,7 @@ impl Server {
                 txn_record.keys.insert(k, TxnState::Local);
                 locked.push(k);
             }
+            self.stats.writes.fetch_add(1, Ordering::SeqCst);
         }
 
         {
@@ -142,6 +149,10 @@ impl Server {
         while let Err(_) = self.rollback_txn(&msg) {
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    fn read(&self, _: Key, _: TxnId) {
+        self.stats.reads.fetch_add(1, Ordering::SeqCst);
     }
 
     // Precondition: lock must not be held by txn id.
@@ -304,6 +315,7 @@ impl Server {
 
         // Remove the txn record to conclude the transaction.
         self.txns.remove(msg.id);
+        self.stats.committed_txns.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -322,6 +334,7 @@ impl Server {
         // FIXME if we get a rollback without any locks/prewrites, then the unwrap is bogus.
         let (_latch, record) = self.txns.blocking_get(msg.id).unwrap();
         record.commit_state = TxnState::RolledBack;
+        self.stats.rolled_back_txns.fetch_add(1, Ordering::SeqCst);
         // TODO ack?
         Ok(())
     }
@@ -331,8 +344,8 @@ impl Server {
         self.transport.send(Box::new(msg));
     }
 
-    fn fail<T: MsgRequest + fmt::Debug>(&self, msg: &T, s: String) {
-        println!("Message handling failed {:?}: {}", msg, s);
+    fn fail<T: MsgRequest + fmt::Debug>(&self, msg: &T, _s: String) {
+        // println!("Message handling failed {:?}: {}", msg, _s);
         if let Some(msg) = msg.response(false) {
             self.transport.send(Box::new(msg));
         }
@@ -387,6 +400,7 @@ impl transport::Receiver for Server {
             );
             thread::sleep(Duration::from_millis(100));
         }
+        self.stats.print();
         Ok(())
     }
 }
@@ -441,4 +455,37 @@ enum TxnState {
 enum LockKind {
     Read,
     Modify,
+}
+
+struct Statistics {
+    committed_txns: AtomicU64,
+    rolled_back_txns: AtomicU64,
+    reads: AtomicU64,
+    writes: AtomicU64,
+    failed_rws: AtomicU64,
+}
+
+impl Statistics {
+    fn new() -> Statistics {
+        Statistics {
+            committed_txns: AtomicU64::new(0),
+            rolled_back_txns: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            failed_rws: AtomicU64::new(0),
+        }
+    }
+
+    fn print(&self) {
+        println!("\nTransactions:");
+        println!("  committed {}", self.committed_txns.load(Ordering::SeqCst));
+        println!(
+            "  rolled_back {}",
+            self.rolled_back_txns.load(Ordering::SeqCst)
+        );
+        println!("  total {}", TXNS);
+        println!("Reads: {}", self.reads.load(Ordering::SeqCst));
+        println!("Writes: {}", self.writes.load(Ordering::SeqCst));
+        println!("Failed: {}\n", self.failed_rws.load(Ordering::SeqCst));
+    }
 }
