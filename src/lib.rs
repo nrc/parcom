@@ -23,6 +23,9 @@ use std::{
     time::Duration,
 };
 
+#[macro_use]
+mod store;
+
 mod client;
 mod latch;
 mod messages;

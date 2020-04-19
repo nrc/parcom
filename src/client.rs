@@ -10,19 +10,18 @@ use std::{
 };
 
 pub struct Client {
-    // TODO use server::store! here
-    txns: UnsafeCell<Box<[Option<Txn>; TXNS]>>,
-    txn_latches: Mutex<Box<[bool; TXNS]>>,
+    txns: TxnStore,
     tso: Tso,
     transport: transport::TransportSend,
     pending: AtomicUsize,
 }
 
+store!(TxnStore, Txn, TxnId, TXNS);
+
 impl Client {
     pub fn new(tso: Tso, transport: transport::TransportSend) -> Client {
         Client {
-            txns: UnsafeCell::new(Box::new([None; TXNS])),
-            txn_latches: Mutex::new(Box::new([false; TXNS])),
+            txns: TxnStore::new(),
             tso,
             transport,
             pending: AtomicUsize::new(0),
@@ -47,18 +46,13 @@ impl Client {
         self.transport.shutdown();
     }
 
+    // Completion of this function indicates that the transaction was sent, not
+    // that it succeeded.
     pub fn exec_txn(&self) {
         let start_ts = self.tso.ts();
         let id = self.tso.id();
 
-        let _latch = latch::block_on_latch(&self.txn_latches, id);
-        let txn: &mut Txn = unsafe {
-            let txns = self.txns.get().as_mut().unwrap();
-            txns[id.into(): usize] = Some(Txn::new());
-            ((&mut txns[id.into(): usize]): &mut Option<Txn>)
-                .as_mut()
-                .unwrap()
-        };
+        let (_latch, txn) = self.txns.get_or_else(id, Txn::new);
 
         for _ in 0..READS_PER_TXN {
             let key = self.exec_lock(id, start_ts);
@@ -69,7 +63,6 @@ impl Client {
         self.pending.fetch_add(1, Ordering::SeqCst);
 
         // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
-        // TODO block waiting for responses.
     }
 
     fn exec_lock(&self, id: TxnId, start_ts: Ts) -> Key {
@@ -104,7 +97,14 @@ impl Client {
         if !msg.success {
             return self.rollback(msg.id);
         }
-        self.assert_txn(msg.id).1.prewrite.as_mut().unwrap().1 = true;
+        self.txns
+            .blocking_get(msg.id)
+            .unwrap()
+            .1
+            .prewrite
+            .as_mut()
+            .unwrap()
+            .1 = true;
         self.check_responses_and_commit(msg.id);
     }
 
@@ -114,7 +114,7 @@ impl Client {
             return self.rollback(msg.id);
         }
         {
-            let (_latch, txn) = self.assert_txn(msg.id);
+            let (_latch, txn) = self.txns.blocking_get(msg.id).unwrap();
             for &mut (k, ref mut b) in &mut txn.locks {
                 if k == msg.key {
                     *b = true;
@@ -126,7 +126,7 @@ impl Client {
 
     fn check_responses_and_commit(&self, id: TxnId) {
         {
-            let (_latch, txn) = self.assert_txn(id);
+            let (_latch, txn) = self.txns.blocking_get(id).unwrap();
             if !txn.complete() || txn.rolled_back {
                 return;
             }
@@ -134,12 +134,12 @@ impl Client {
 
         let msg = messages::FinaliseRequest { id };
         self.transport.send(Box::new(msg));
-        println!("commit {:?}", id);
+        // At this point we can communicate success to the user.
         self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn rollback(&self, id: TxnId) {
-        let (_latch, txn) = self.assert_txn(id);
+        let (_latch, txn) = self.txns.blocking_get(id).unwrap();
         if txn.rolled_back {
             return;
         }
@@ -153,20 +153,6 @@ impl Client {
         self.transport.send(Box::new(msg));
         println!("rollback {:?}", id);
         self.pending.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    fn assert_txn<'a>(&'a self, id: TxnId) -> (latch::Latch<'a, { TXNS }>, &mut Txn) {
-        loop {
-            if let Ok(latch) = latch::block_on_latch(&self.txn_latches, id) {
-                let txn = unsafe {
-                    self.txns.get().as_mut().unwrap()[id.into(): usize]
-                        .as_mut()
-                        .unwrap()
-                };
-                return (latch, txn);
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
     }
 }
 
