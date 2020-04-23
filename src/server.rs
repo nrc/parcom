@@ -275,8 +275,8 @@ impl Server {
         // Unlock any keys we previously locked.
         let (_latch, txn_record) = self.txns.blocking_get(id).unwrap();
         for &k in locked {
-            txn_record.keys.remove(&k);
             let (_latch, record) = self.keys.try_get(k)?.unwrap();
+            txn_record.keys.remove(&k);
             if let Some(lock) = record.lock.as_ref() {
                 if lock.id == id {
                     record.history.push((record.lock.take().unwrap(), false));
@@ -361,13 +361,13 @@ impl Server {
             if *s == LockStatus::Unlocked {
                 continue;
             }
+            let (_latch, record) = self.keys.try_get(k)?.unwrap();
             assert!(
                 s.has_consensus(),
                 "no consensus for key {:?}, txn {:?}",
                 k,
                 txn_id,
             );
-            let (_latch, record) = self.keys.try_get(k)?.unwrap();
             // eprintln!("unlock {:?} {:?}", k, txn_id);
             let lock = record.lock.as_ref().unwrap();
             assert!(lock.id == txn_id);
@@ -394,12 +394,11 @@ impl Server {
             .txns
             .blocking_get(msg.id)
             .expect(&format!("Missing txn record {:?}", msg.id));
-        assert!(
-            txn_record.commit_state == TxnState::Local
-                || txn_record.commit_state == TxnState::Consensus,
-            "re-finalising? {:?}",
-            msg.id
-        );
+        if !(txn_record.commit_state == TxnState::Local
+            || txn_record.commit_state == TxnState::Consensus)
+        {
+            return Ok(());
+        }
         txn_record.commit_state = TxnState::Consensus;
         self.finalise(msg.id, txn_record)
     }
@@ -410,10 +409,14 @@ impl Server {
             if *s == LockStatus::Unlocked {
                 continue;
             }
-            let (_latch, record) = self
-                .keys
-                .try_get(k)?
-                .expect(&format!("Missing key record for {:?} from {:?}", k, txn_id));
+            let (_latch, record) = match self.keys.try_get(k)? {
+                Some(tup) => tup,
+                None if *s == LockStatus::Unknown => {
+                    *s = LockStatus::Unlocked;
+                    continue;
+                }
+                None => unreachable!("Missing key record for {:?}({:?}) from {:?}", k, s, txn_id),
+            };
             if let Some(lock) = record.lock.as_ref() {
                 if lock.id == txn_id {
                     record.history.push((record.lock.take().unwrap(), false));

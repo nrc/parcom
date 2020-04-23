@@ -1,7 +1,5 @@
 // TODO
 //
-// recovery
-//   timeouts
 // consensus write after failure
 // retries
 // for_update_ts and partial retries
@@ -36,7 +34,7 @@ mod transport;
 
 const READS_PER_TXN: usize = 10;
 const WRITES_PER_TXN: usize = 10;
-const TXNS: usize = 2;
+const TXNS: usize = 10;
 const MAX_KEY: usize = 1000;
 const MIN_CONSENSUS_TIME: u64 = 10;
 const MAX_CONSENSUS_TIME: u64 = 100;
