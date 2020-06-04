@@ -10,6 +10,7 @@ use std::{
     time::Instant,
 };
 
+// The real client is TiDB.
 pub struct Client {
     txns: TxnStore,
     tso: Tso,
@@ -37,11 +38,19 @@ impl Client {
                     "shutdown timed out {} transactions pending",
                     self.pending.load(Ordering::SeqCst)
                 );
+                for id in 0..TXNS {
+                    let txn = self.txns.get_unsafe(TxnId(id));
+                    println!(
+                        "{}: {}",
+                        id,
+                        txn.map(|t| t.status()).unwrap_or("no txn".to_owned())
+                    );
+                }
                 break;
             }
 
             sleep_count -= 1;
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(100));
         }
 
         self.transport.shutdown();
@@ -63,7 +72,7 @@ impl Client {
         txn.prewrite = Some((keys, false));
         self.pending.fetch_add(1, Ordering::SeqCst);
 
-        // TODO block waiting for acks (currently ignored). Why? Or do it for each request?
+        // TODO block waiting for acks (currently ignored). Why? Or do it for each request? - because we need to know that a request was received
     }
 
     fn exec_lock(&self, id: TxnId, start_ts: Ts) -> Key {
@@ -118,6 +127,9 @@ impl Client {
         }
         {
             let (_latch, txn) = self.txns.blocking_get(msg.id).unwrap();
+            if txn.rolled_back {
+                return;
+            }
             for &mut (k, ref mut b) in &mut txn.locks {
                 if k == msg.key {
                     *b = true;
@@ -128,16 +140,15 @@ impl Client {
     }
 
     fn check_responses_and_commit(&self, id: TxnId) {
-        {
-            let (_latch, txn) = self.txns.blocking_get(id).unwrap();
-            if !txn.complete() || txn.rolled_back {
-                return;
-            }
+        let (_latch, txn) = self.txns.blocking_get(id).unwrap();
+        if !txn.complete() || txn.rolled_back || txn.committed {
+            return;
         }
+        // At this point we can communicate success to the user.
+        txn.committed = true;
 
         let msg = messages::FinaliseRequest { id };
         self.transport.send(Box::new(msg));
-        // At this point we can communicate success to the user.
         self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -146,14 +157,14 @@ impl Client {
         if txn.rolled_back {
             return;
         }
-        assert!(!txn.complete());
+        assert!(!txn.complete() && !txn.committed);
+        txn.rolled_back = true;
 
         let msg = messages::RollbackRequest {
             id,
             keys: txn.keys(),
         };
         self.transport.send(Box::new(msg));
-        txn.rolled_back = true;
         self.pending.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -207,6 +218,7 @@ struct Txn {
     locks: Vec<(Key, bool)>,
     prewrite: Option<(Vec<Key>, bool)>,
     rolled_back: bool,
+    committed: bool,
 }
 
 impl Txn {
@@ -215,6 +227,7 @@ impl Txn {
             locks: Vec::new(),
             prewrite: None,
             rolled_back: false,
+            committed: false,
         }
     }
 
@@ -225,6 +238,30 @@ impl Txn {
         }
 
         self.locks.iter().all(|(_, b)| *b)
+    }
+
+    fn status(&self) -> String {
+        if self.committed {
+            return "committed".to_owned();
+        }
+        if self.rolled_back {
+            return "rolled back".to_owned();
+        }
+        if self.complete() {
+            return "complete".to_owned();
+        }
+
+        let prewrite = match &self.prewrite {
+            Some((_, true)) => "prewrite complete",
+            None => "No prewrite",
+            _ => "Unfinished prewrite",
+        };
+
+        if self.locks.iter().all(|(_, b)| *b) {
+            format!("all locks complete, {}", prewrite)
+        } else {
+            format!("not all locks complete, {}", prewrite)
+        }
     }
 
     fn keys(&self) -> Vec<Key> {

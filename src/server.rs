@@ -1,10 +1,9 @@
-use crate::{messages::MsgRequest, *};
+use crate::{messages::MsgRequest, server_types::*, *};
 use rand::{self, Rng};
 use std::{
     any,
     cell::UnsafeCell,
-    collections::HashMap,
-    fmt,
+    fmt, mem,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -13,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+// The real Server is TiKV.
 pub struct Server {
     // We use txn records indexed by start TS, rather than storing this info on the primary lock.
     // The two approaches are equivalent.
@@ -38,10 +38,12 @@ impl Server {
         assert!(self.txns.unlocked());
         assert!(self.keys.unlocked());
 
+        // Check for any keys which are still locked. A key locked suggests an
+        // error in the protocol because it means a transaction is still in progress.
         for k in 0..MAX_KEY {
             if let Some((_latch, record)) = self.keys.blocking_get(Key(k)) {
                 if record.lock.is_some() {
-                    println!("Key({:?}) locked {:?}", k, record.history);
+                    println!("ERROR key({:?}) locked {:?}", k, record.history);
                     let (_latch, txn) = self
                         .txns
                         .blocking_get(record.lock.as_ref().unwrap().id)
@@ -61,12 +63,13 @@ impl Server {
                 .txns
                 .get_or_else(msg.id, || TxnRecord::new(msg.start_ts, msg.timeout));
             if txn_record.commit_state != TxnState::Local {
+                // eprintln!("non-local commit state in lock {:?} {:?}", txn_record.commit_state, msg.id);
+                self.fail(&*msg, "Transaction concluded".to_owned());
                 return;
             }
-        }
-        {
+
             // TODO record writes or locks or both?
-            if self.txn_contains_key(msg.id, msg.key, msg.start_ts, msg.timeout) {
+            if txn_record.keys.contains_key(&msg.key) {
                 // Check we have locked this key.
                 let (_latch, record) = self.keys.get_or_else(msg.key, Record::default);
                 assert_eq!(
@@ -78,15 +81,19 @@ impl Server {
                     msg.id
                 );
             } else {
-                if let Err(s) =
-                    self.aquire_lock_and_set_value(msg.key, msg.id, msg.start_ts, msg.timeout, None)
-                {
+                if let Err(s) = self.aquire_lock_and_set_value(
+                    msg.key,
+                    msg.id,
+                    txn_record,
+                    msg.timeout,
+                    None,
+                    false,
+                ) {
                     self.stats.failed_rws.fetch_add(1, Ordering::SeqCst);
                     self.fail(&*msg, s);
-                    println!("locking read failed {:?} {:?}", msg.key, msg.id);
+                    // println!("locking read failed {:?} {:?}", msg.key, msg.id);
                     return;
                 }
-                let (_latch, txn_record) = self.txns.blocking_get(msg.id).unwrap();
                 assert_eq!(msg.start_ts, txn_record.start_ts);
                 txn_record.keys.insert(msg.key, LockStatus::local());
                 if txn_record.timeout < msg.timeout {
@@ -107,53 +114,58 @@ impl Server {
                 .txns
                 .get_or_else(msg.id, || TxnRecord::new(msg.start_ts, msg.timeout));
             if txn_record.commit_state != TxnState::Local {
+                // eprintln!("non-local commit state {:?} {:?}", txn_record.commit_state, msg.id);
+                self.fail(&*msg, "Transaction concluded".to_owned());
                 return;
             }
-        }
-        let mut locked = Vec::new();
-        for &(k, v) in &msg.writes {
-            // eprintln!("prewrite key {:?} {:?}", msg.id, k);
-            if self.txn_contains_key(msg.id, k, msg.start_ts, msg.timeout) {
-                // Key is already locked, just need to write the value.
-                let (_latch, record) = self.keys.get_or_else(k, Record::default);
-                assert_eq!(record.lock.as_ref().unwrap().id, msg.id);
-                record.values.insert(msg.start_ts, v);
-            } else {
-                // Lock and set value.
-                if let Err(s) =
-                    self.aquire_lock_and_set_value(k, msg.id, msg.start_ts, msg.timeout, Some(v))
-                {
-                    // eprintln!("Failed to lock {:?} {:?}", k, msg.id);
-                    while let Err(_) = self.abort_prewrite(msg.id, &locked) {
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                    self.stats.failed_rws.fetch_add(1, Ordering::SeqCst);
-                    self.fail(&*msg, s);
-                    return;
-                }
-                let (_latch, txn_record) = self.txns.blocking_get(msg.id).unwrap();
-                txn_record.keys.insert(k, LockStatus::local());
-                locked.push(k);
-            }
-            self.stats.writes.fetch_add(1, Ordering::SeqCst);
-        }
 
-        {
-            let (_latch, txn_record) = self
-                .txns
-                .get_or_else(msg.id, || TxnRecord::new(msg.start_ts, msg.timeout));
+            let mut locked = Vec::new();
+            for &(k, v) in &msg.writes {
+                // eprintln!("prewrite key {:?} {:?}", msg.id, k);
+                if txn_record.keys.contains_key(&k) {
+                    // Key is already locked, just need to write the value.
+                    let (_latch, record) = self.keys.get_or_else(k, Record::default);
+                    assert_eq!(record.lock.as_ref().unwrap().id, msg.id);
+                    record.values.insert(msg.start_ts, v);
+                } else {
+                    // Lock and set value.
+                    // eprintln!("pre-aquire_lock_and_set_value {:?}", msg.id);
+                    if let Err(s) = self.aquire_lock_and_set_value(
+                        k,
+                        msg.id,
+                        txn_record,
+                        msg.timeout,
+                        Some(v),
+                        false,
+                    ) {
+                        // eprintln!("Failed to lock {:?} {:?}", k, msg.id);
+                        while let Err(_) = self.abort_prewrite(txn_record, msg.id, &locked) {
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        // eprintln!("prewrite aborted {:?}", msg.id);
+                        self.stats.failed_rws.fetch_add(1, Ordering::SeqCst);
+                        self.fail(&*msg, s);
+                        return;
+                    }
+                    txn_record.keys.insert(k, LockStatus::local());
+                    locked.push(k);
+                }
+                self.stats.writes.fetch_add(1, Ordering::SeqCst);
+            }
+
             txn_record.commit_ts = Some(msg.commit_ts);
             if txn_record.timeout < msg.timeout {
                 txn_record.timeout = msg.timeout;
             }
         }
 
+        // eprintln!("prewrite success {:?}", msg.id);
         self.ack(&*msg);
         self.async_consensus_write_prewrite(&msg);
     }
 
     fn handle_finalise(&self, msg: Box<messages::FinaliseRequest>) {
-        // eprintln!("finalise {:?}", msg.id);
+        //eprintln!("h finalise {:?}", msg.id);
         // TODO should we break out of this after a while?
         while let Err(_) = self.finalise_txn(&msg) {
             thread::sleep(Duration::from_millis(50));
@@ -161,7 +173,7 @@ impl Server {
     }
 
     fn handle_rollback(&self, msg: Box<messages::RollbackRequest>) {
-        // eprintln!("rollback {:?}", msg.id);
+        //eprintln!("h rollback {:?}", msg.id);
         // Retry the rollback since failure must be due to latch deadlock.
         while let Err(_) = self.rollback_txn(&msg) {
             thread::sleep(Duration::from_millis(50));
@@ -173,36 +185,44 @@ impl Server {
     }
 
     // Precondition: lock must not be held by txn id.
-    // No latches may be held.
+    // Caller should hold the latch for id, but no latches for keys.
     fn aquire_lock_and_set_value(
         &self,
         key: Key,
         id: TxnId,
-        start_ts: Ts,
+        txn_record: &mut TxnRecord,
         time: Instant,
         value: Option<Value>,
+        is_retry: bool,
     ) -> Result<(), String> {
-        let (_latch, record) = loop {
-            let key_tup = self.keys.get_or_else(key, Record::default);
+        let (latch, record) = self.keys.get_or_else(key, Record::default);
 
+        if let Some(lock) = &record.lock {
+            let lock_id = lock.id;
+
+            if is_retry {
+                return Err(format!("Key locked {:?} by {:?}", key, lock_id,));
+            }
+
+            mem::drop(latch);
             {
-                if let Ok(tup) = self.txns.try_get(id) {
-                    let (_latch, txn_record) = tup.unwrap();
-                    // Need to check commit state again since the txn may have been rolled
-                    // back while we waited for the latch.
-                    if txn_record.commit_state == TxnState::RollingBack {
-                        return Err(format!("{:?} already rolled back", id));
-                    }
-                    break key_tup;
+                // TODO could be moved inside resolve_lock
+                if let Some(txn) = self.txns.try_try_get(lock_id) {
+                    let (_txn_latch, lock_txn) = txn.expect("No txn record?");
+                    let result = self.resolve_lock(lock_id, lock_txn, time);
+                    // eprintln!("post-resolve lock {:?} {:?} {:?}", id, lock_id, result);
+                    result?;
+                } else {
+                    // TODO retry
+                    return Err("Transaction locked".to_owned());
                 }
             }
 
-            thread::sleep(Duration::from_millis(50));
-        };
-
-        if record.lock.is_none() {
+            // retry
+            self.aquire_lock_and_set_value(key, id, txn_record, time, value, true)
+        } else {
             let lock_kind = if let Some(v) = value {
-                let exists = record.values.insert(start_ts, v);
+                let exists = record.values.insert(txn_record.start_ts, v);
                 assert!(exists.is_none());
                 LockKind::Modify
             } else {
@@ -216,20 +236,16 @@ impl Server {
             record.lock = Some(lock.clone());
             record.history.push((lock, true));
             Ok(())
-        } else {
-            self.resolve_lock(record, time)?;
-            Err(format!(
-                "Key locked {:?} by {:?}",
-                key,
-                record.lock.as_ref().unwrap().id
-            ))
         }
     }
 
     // Postcondition: if returns Ok, then all keys in key's txn are unlocked (including key).
-    fn resolve_lock(&self, record: &mut Record, time: Instant) -> Result<(), String> {
-        let txn_id = record.lock.as_ref().unwrap().id;
-        let (_latch, txn_record) = self.txns.blocking_get(txn_id).unwrap();
+    fn resolve_lock(
+        &self,
+        txn_id: TxnId,
+        txn_record: &mut TxnRecord,
+        time: Instant,
+    ) -> Result<(), String> {
         if time < txn_record.timeout {
             // FIXME return lock time to client so it can resolve and retry.
             return Err("lock still alive".to_owned());
@@ -243,13 +259,10 @@ impl Server {
         // First check the status of the transaction in case there was an incomplete finalisation or
         // rollback, in those cases continue it.
         match txn_record.commit_state {
-            TxnState::Consensus => {
-                self.finalise(txn_id, txn_record)?;
-                return Ok(());
-            }
+            TxnState::Consensus => return self.finalise(txn_id, txn_record),
             TxnState::RollingBack => {
-                self.rollback(txn_id, txn_record)?;
-                return Ok(());
+                // eprintln!("Rollback due to resolve_lock {:?}", txn_id);
+                return self.rollback(txn_id, txn_record);
             }
             TxnState::Local => {}
             // Unreachable because key must not be locked in this case.
@@ -260,20 +273,24 @@ impl Server {
         for &s in txn_record.keys.values() {
             if !s.has_consensus() {
                 // Reaching consensus timed out, rollback the whole txn.
+                // eprintln!("Consensus failure {:?}", txn_id);
                 txn_record.commit_state = TxnState::RollingBack;
-                self.rollback(txn_id, txn_record)?;
-                return Ok(());
+                return self.rollback(txn_id, txn_record);
             }
         }
         // If we finished the above loop, then every lock has consensus but the txn
         // was never finalised.
-        self.finalise(txn_id, txn_record)?;
-        Ok(())
+        txn_record.commit_state = TxnState::Consensus;
+        self.finalise(txn_id, txn_record)
     }
 
-    fn abort_prewrite(&self, id: TxnId, locked: &[Key]) -> Result<(), String> {
+    fn abort_prewrite(
+        &self,
+        txn_record: &mut TxnRecord,
+        id: TxnId,
+        locked: &[Key],
+    ) -> Result<(), String> {
         // Unlock any keys we previously locked.
-        let (_latch, txn_record) = self.txns.blocking_get(id).unwrap();
         for &k in locked {
             let (_latch, record) = self.keys.try_get(k)?.unwrap();
             txn_record.keys.remove(&k);
@@ -342,6 +359,7 @@ impl Server {
 
         for &(k, _) in &msg.writes {
             if let Err(s) = self.update_lock_state(k, msg.id) {
+                eprintln!("update lock failed {:?} {}", msg.id, s);
                 // Leaves keys locked without a txn, but that should get sorted out when we rollback.
                 self.fail(msg, s);
                 return;
@@ -356,6 +374,7 @@ impl Server {
     }
 
     fn finalise(&self, txn_id: TxnId, txn_record: &mut TxnRecord) -> Result<(), String> {
+        assert_eq!(txn_record.commit_state, TxnState::Consensus);
         // Commit each key write, remove the lock.
         for (&k, s) in &mut txn_record.keys {
             if *s == LockStatus::Unlocked {
@@ -384,7 +403,7 @@ impl Server {
         }
 
         txn_record.commit_state = TxnState::Finished;
-
+        // eprintln!("committed {:?}", txn_id);
         self.stats.committed_txns.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -394,8 +413,8 @@ impl Server {
             .txns
             .blocking_get(msg.id)
             .expect(&format!("Missing txn record {:?}", msg.id));
-        if !(txn_record.commit_state == TxnState::Local
-            || txn_record.commit_state == TxnState::Consensus)
+        if txn_record.commit_state == TxnState::RollingBack
+            || txn_record.commit_state == TxnState::Finished
         {
             return Ok(());
         }
@@ -404,6 +423,7 @@ impl Server {
     }
 
     fn rollback(&self, txn_id: TxnId, txn_record: &mut TxnRecord) -> Result<(), String> {
+        assert_eq!(txn_record.commit_state, TxnState::RollingBack);
         for (&k, s) in &mut txn_record.keys {
             // println!("rolling back {:?}, {:?}", msg.id, k);
             if *s == LockStatus::Unlocked {
@@ -426,6 +446,7 @@ impl Server {
         }
 
         txn_record.commit_state = TxnState::Finished;
+        // eprintln!("rollback {:?}", txn_id);
         self.stats.rolled_back_txns.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -433,6 +454,9 @@ impl Server {
     fn rollback_txn(&self, msg: &messages::RollbackRequest) -> Result<(), String> {
         // FIXME if we get a rollback without previously receiving any locks/prewrites, then the unwrap is bogus.
         let (_latch, txn_record) = self.txns.blocking_get(msg.id).unwrap();
+        if txn_record.commit_state == TxnState::Finished {
+            return Ok(());
+        }
         for k in &msg.keys {
             if !txn_record.keys.contains_key(k) {
                 txn_record.keys.insert(*k, LockStatus::Unknown);
@@ -440,10 +464,9 @@ impl Server {
         }
 
         txn_record.commit_state = TxnState::RollingBack;
-        self.rollback(msg.id, txn_record)?;
-
+        // eprintln!("rollback request {:?}", msg.id);
+        self.rollback(msg.id, txn_record)
         // TODO ack?
-        Ok(())
     }
 
     fn ack<T: MsgRequest>(&self, msg: &T) {
@@ -461,13 +484,6 @@ impl Server {
     fn respond<T: MsgRequest>(&self, msg: &T) {
         let msg = msg.response(true).unwrap();
         self.transport.send(Box::new(msg));
-    }
-
-    fn txn_contains_key(&self, id: TxnId, key: Key, start_ts: Ts, timeout: Instant) -> bool {
-        let (_latch, record) = self
-            .txns
-            .get_or_else(id, || TxnRecord::new(start_ts, timeout));
-        record.keys.contains_key(&key)
     }
 }
 
@@ -512,124 +528,6 @@ impl transport::Receiver for Server {
     }
 }
 
+// Invariant: never hold a key latch when attempting to get a txn latch.
 store!(TxnStore, TxnRecord, TxnId, TXNS);
 store!(KvStore, Record, Key, MAX_KEY);
-
-#[derive(Default, Clone)]
-struct Record {
-    values: HashMap<Ts, Value>,
-    // commit ts, start ts; ordered by commit ts, descending.
-    writes: Vec<(Ts, Ts)>,
-    lock: Option<Lock>,
-    history: Vec<(Lock, bool)>,
-}
-
-#[derive(Clone, Debug)]
-struct TxnRecord {
-    // TODO update comment
-    // Lock state is none if the lock is not held (mid-rollback, mid-finalisation, or txn is finished)
-    // or the state of the lock is unknown.
-    // Otherwise LockState::Consensus => key's lock.state == LockState::Consensus.
-    keys: HashMap<Key, LockStatus>,
-    commit_state: TxnState,
-    commit_ts: Option<Ts>,
-    start_ts: Ts,
-    timeout: Instant,
-}
-
-impl TxnRecord {
-    fn new(start_ts: Ts, timeout: Instant) -> TxnRecord {
-        TxnRecord {
-            keys: HashMap::new(),
-            commit_state: TxnState::Local,
-            commit_ts: None,
-            start_ts,
-            timeout,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Lock {
-    id: TxnId,
-    state: LockState,
-    kind: LockKind,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum LockStatus {
-    Locked(LockState),
-    Unlocked,
-    Unknown,
-}
-
-impl LockStatus {
-    fn local() -> LockStatus {
-        LockStatus::Locked(LockState::Local)
-    }
-
-    fn has_consensus(self) -> bool {
-        match self {
-            LockStatus::Locked(LockState::Consensus) => true,
-            _ => false,
-        }
-    }
-}
-
-// Invariant: never change Consensus -> Local.
-// Invariant: to change Local -> Consensus the thread must hold the latch for
-// the lock's key and the key's transaction record.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum LockState {
-    Local,
-    Consensus,
-}
-
-// Valid state changes: Local -> Consensus -> Finished,
-//                      Local -> RolledBack.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum TxnState {
-    Local,
-    Consensus,
-    RollingBack,
-    Finished,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum LockKind {
-    Read,
-    Modify,
-}
-
-struct Statistics {
-    committed_txns: AtomicU64,
-    rolled_back_txns: AtomicU64,
-    reads: AtomicU64,
-    writes: AtomicU64,
-    failed_rws: AtomicU64,
-}
-
-impl Statistics {
-    fn new() -> Statistics {
-        Statistics {
-            committed_txns: AtomicU64::new(0),
-            rolled_back_txns: AtomicU64::new(0),
-            reads: AtomicU64::new(0),
-            writes: AtomicU64::new(0),
-            failed_rws: AtomicU64::new(0),
-        }
-    }
-
-    fn print(&self) {
-        println!("\nTransactions:");
-        println!("  committed {}", self.committed_txns.load(Ordering::SeqCst));
-        println!(
-            "  rolled_back {}",
-            self.rolled_back_txns.load(Ordering::SeqCst)
-        );
-        println!("  total {}", TXNS);
-        println!("Reads: {}", self.reads.load(Ordering::SeqCst));
-        println!("Writes: {}", self.writes.load(Ordering::SeqCst));
-        println!("Failed: {}\n", self.failed_rws.load(Ordering::SeqCst));
-    }
-}

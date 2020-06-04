@@ -30,6 +30,22 @@ pub fn block_on_latch<'a, T: Into<usize> + Copy + fmt::Debug, const N: usize>(
     Ok(Latch { key, latches })
 }
 
+pub fn try_latch<'a, T: Into<usize> + Copy + fmt::Debug, const N: usize>(
+    latches: &'a Mutex<Box<[bool; { N }]>>,
+    key: T,
+) -> Option<Latch<'a, { N }>> {
+    let key = key.into();
+    {
+        let mut latches = latches.lock().unwrap();
+        if latches[key] {
+            return None;
+        }
+
+        latches[key] = true;
+    }
+    Some(Latch { key, latches })
+}
+
 impl<'a, const N: usize> Drop for Latch<'a, { N }> {
     fn drop(&mut self) {
         // eprintln!("drop latch for {:?}", self.key);

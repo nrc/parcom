@@ -30,6 +30,7 @@ mod client;
 mod latch;
 mod messages;
 mod server;
+mod server_types;
 mod transport;
 
 const READS_PER_TXN: usize = 10;
@@ -104,7 +105,7 @@ pub fn start() {
         client.exec_txn();
     }
 
-    println!("Begin shutdown");
+    //println!("Begin shutdown");
     client.shutdown();
     handle2.join().unwrap();
     j2.join().unwrap();

@@ -45,6 +45,7 @@ macro_rules! store {
                             return (latch, map[id].as_mut().unwrap());
                         }
                     }
+                    // TODO this is a retry after timeout?
                     thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -55,6 +56,26 @@ macro_rules! store {
                 id: $Id,
             ) -> Result<Option<(latch::Latch<'a, $size>, &mut $T)>, String> {
                 latch::block_on_latch(&self.latches, id).map(|latch| {
+                    return unsafe {
+                        self.entries.get().as_mut().unwrap()[id.into(): usize]
+                            .as_mut()
+                            .map(|record| (latch, record))
+                    };
+                })
+            }
+
+            fn get_unsafe<'a>(&'a self, id: $Id) -> Option<&$T> {
+                unsafe { self.entries.get().as_mut().unwrap()[id.into(): usize].as_ref() }
+            }
+
+            // Returns None if the latch is held, Some(None) if the latch is not held and there is no
+            // entry for id.
+            // The caller should not hold any latches when calling this function.
+            fn try_try_get<'a>(
+                &'a self,
+                id: $Id,
+            ) -> Option<Option<(latch::Latch<'a, $size>, &mut $T)>> {
+                latch::try_latch(&self.latches, id).map(|latch| {
                     return unsafe {
                         self.entries.get().as_mut().unwrap()[id.into(): usize]
                             .as_mut()
