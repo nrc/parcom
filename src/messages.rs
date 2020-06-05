@@ -18,7 +18,7 @@ pub struct LockRequest {
     pub key: Key,
     pub id: TxnId,
     pub start_ts: Ts,
-    // TODO do we need a timeout here, or just on prewrite?
+    pub current_time: Instant,
     pub timeout: Instant,
     pub for_update_ts: Ts,
 }
@@ -62,6 +62,7 @@ pub struct PrewriteRequest {
     pub id: TxnId,
     pub start_ts: Ts,
     pub commit_ts: Ts,
+    pub current_time: Instant,
     pub timeout: Instant,
     pub writes: Vec<(Key, Value)>,
 }

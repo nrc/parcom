@@ -2,12 +2,12 @@
 //
 // retries
 // for_update_ts and partial retries
-// non-locking reads (and the reading part of locking reads)
+// non-locking reads (and consensus read for locking reads)
 // failures
 // multi-threaded client
 // multiple clients and servers
+// multiple regions
 // deadlock?
-// add a User, check invariants?
 
 #![allow(incomplete_features)]
 #![feature(const_generics)]

@@ -16,10 +16,6 @@ pub struct Record {
 
 #[derive(Clone, Debug)]
 pub struct TxnRecord {
-    // TODO update comment
-    // Lock state is none if the lock is not held (mid-rollback, mid-finalisation, or txn is finished)
-    // or the state of the lock is unknown.
-    // Otherwise LockState::Consensus => key's lock.state == LockState::Consensus.
     pub keys: HashMap<Key, LockStatus>,
     pub commit_state: TxnState,
     pub commit_ts: Option<Ts>,

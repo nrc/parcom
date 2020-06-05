@@ -68,21 +68,23 @@ impl Client {
             let key = self.exec_lock(id, start_ts);
             txn.locks.push((key, false));
         }
+        // TODO block waiting for acks (currently ignored). Retry if no ack.
         let keys = self.exec_prewrite(id, start_ts);
         txn.prewrite = Some((keys, false));
         self.pending.fetch_add(1, Ordering::SeqCst);
-
-        // TODO block waiting for acks (currently ignored). Why? Or do it for each request? - because we need to know that a request was received
+        // TODO block waiting for prewrite ack (currently ignored). Retry if no ack.
     }
 
     fn exec_lock(&self, id: TxnId, start_ts: Ts) -> Key {
         let key = random_key();
+        let now = Instant::now();
         let msg = messages::LockRequest {
             id,
             key,
             start_ts,
             for_update_ts: self.tso.ts(),
-            timeout: Instant::now() + Duration::from_millis(500),
+            current_time: now,
+            timeout: now + Duration::from_millis(500),
         };
         self.transport.send(Box::new(msg));
         key
@@ -93,12 +95,14 @@ impl Client {
             .map(|_| (random_key(), random_value()))
             .collect();
         let keys = writes.iter().map(|&(k, _)| k).collect();
+        let now = Instant::now();
         let msg = messages::PrewriteRequest {
             id,
             start_ts,
             commit_ts: self.tso.ts(),
             writes,
-            timeout: Instant::now() + Duration::from_millis(500),
+            current_time: now,
+            timeout: now + Duration::from_millis(500),
         };
         self.transport.send(Box::new(msg));
         keys

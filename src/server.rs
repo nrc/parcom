@@ -84,7 +84,7 @@ impl Server {
                     msg.key,
                     msg.id,
                     txn_record,
-                    msg.timeout,
+                    msg.current_time,
                     None,
                     false,
                 ) {
@@ -107,6 +107,7 @@ impl Server {
             self.read(msg.key, msg.id);
         }
 
+        // TODO ack can return the read value.
         self.ack(&*msg);
         // TODO maybe retry?
         if let Err(s) = self.async_consensus_write_lock(&msg) {
@@ -140,7 +141,7 @@ impl Server {
                         k,
                         msg.id,
                         txn_record,
-                        msg.timeout,
+                        msg.current_time,
                         Some(v),
                         false,
                     ) {
@@ -191,6 +192,7 @@ impl Server {
     }
 
     fn read(&self, _: Key, _: TxnId) {
+        // TODO do we need consensus here.
         self.stats.reads.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -270,7 +272,8 @@ impl Server {
             TxnState::Finished => unreachable!(),
         }
 
-        // Now we must check each key.
+        // Now we must check each key. Note that we have latched the transaction record, so we don't
+        // to worry about a lock changing state.
         for &s in txn_record.keys.values() {
             if !s.has_consensus() {
                 // Reaching consensus timed out, rollback the whole txn.
