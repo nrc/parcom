@@ -184,6 +184,10 @@ impl transport::Receiver for Client {
             Ok(_) => return Ok(()),
             Err(msg) => msg,
         };
+        let msg = match msg.downcast::<messages::UnitAck>() {
+            Ok(_) => return Ok(()),
+            Err(msg) => msg,
+        };
         let msg = match msg.downcast() {
             Ok(msg) => {
                 self.handle_lock_response(msg);

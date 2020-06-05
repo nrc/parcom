@@ -101,7 +101,11 @@ pub struct FinaliseRequest {
 
 impl MsgRequest for FinaliseRequest {
     type Response = !;
-    type Ack = !;
+    type Ack = UnitAck;
+
+    fn ack(&self) -> Option<UnitAck> {
+        Some(UnitAck { id: self.id })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +116,11 @@ pub struct RollbackRequest {
 
 impl MsgRequest for RollbackRequest {
     type Response = !;
-    type Ack = !;
+    type Ack = UnitAck;
+
+    fn ack(&self) -> Option<UnitAck> {
+        Some(UnitAck { id: self.id })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,4 +129,9 @@ pub struct Shutdown;
 impl MsgRequest for Shutdown {
     type Response = !;
     type Ack = !;
+}
+
+#[derive(Debug, Clone)]
+pub struct UnitAck {
+    pub id: TxnId,
 }

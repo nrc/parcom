@@ -68,7 +68,6 @@ impl Server {
                 return;
             }
 
-            // TODO record writes or locks or both?
             if txn_record.keys.contains_key(&msg.key) {
                 // Check we have locked this key.
                 let (_latch, record) = self.keys.get_or_else(msg.key, Record::default);
@@ -90,6 +89,11 @@ impl Server {
                     false,
                 ) {
                     self.stats.failed_rws.fetch_add(1, Ordering::SeqCst);
+                    txn_record.commit_state = TxnState::RollingBack;
+                    while let Err(_) = self.rollback(msg.id, txn_record) {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+
                     self.fail(&*msg, s);
                     // println!("locking read failed {:?} {:?}", msg.key, msg.id);
                     return;
@@ -99,12 +103,15 @@ impl Server {
                 if txn_record.timeout < msg.timeout {
                     txn_record.timeout = msg.timeout;
                 }
-                self.read(msg.key, msg.id);
             }
+            self.read(msg.key, msg.id);
         }
 
         self.ack(&*msg);
-        self.async_consensus_write_lock(&msg);
+        // TODO maybe retry?
+        if let Err(s) = self.async_consensus_write_lock(&msg) {
+            self.fail(&*msg, s);
+        }
     }
 
     fn handle_prewrite(&self, msg: Box<messages::PrewriteRequest>) {
@@ -119,7 +126,6 @@ impl Server {
                 return;
             }
 
-            let mut locked = Vec::new();
             for &(k, v) in &msg.writes {
                 // eprintln!("prewrite key {:?} {:?}", msg.id, k);
                 if txn_record.keys.contains_key(&k) {
@@ -139,16 +145,17 @@ impl Server {
                         false,
                     ) {
                         // eprintln!("Failed to lock {:?} {:?}", k, msg.id);
-                        while let Err(_) = self.abort_prewrite(txn_record, msg.id, &locked) {
+                        txn_record.commit_state = TxnState::RollingBack;
+                        while let Err(_) = self.rollback(msg.id, txn_record) {
                             thread::sleep(Duration::from_millis(50));
                         }
+
                         // eprintln!("prewrite aborted {:?}", msg.id);
                         self.stats.failed_rws.fetch_add(1, Ordering::SeqCst);
                         self.fail(&*msg, s);
                         return;
                     }
                     txn_record.keys.insert(k, LockStatus::local());
-                    locked.push(k);
                 }
                 self.stats.writes.fetch_add(1, Ordering::SeqCst);
             }
@@ -161,15 +168,17 @@ impl Server {
 
         // eprintln!("prewrite success {:?}", msg.id);
         self.ack(&*msg);
-        self.async_consensus_write_prewrite(&msg);
+        if let Err(s) = self.async_consensus_write_prewrite(&msg) {
+            self.fail(&*msg, s);
+        }
     }
 
     fn handle_finalise(&self, msg: Box<messages::FinaliseRequest>) {
         //eprintln!("h finalise {:?}", msg.id);
-        // TODO should we break out of this after a while?
         while let Err(_) = self.finalise_txn(&msg) {
             thread::sleep(Duration::from_millis(50));
         }
+        self.ack(&*msg);
     }
 
     fn handle_rollback(&self, msg: Box<messages::RollbackRequest>) {
@@ -178,6 +187,7 @@ impl Server {
         while let Err(_) = self.rollback_txn(&msg) {
             thread::sleep(Duration::from_millis(50));
         }
+        self.ack(&*msg);
     }
 
     fn read(&self, _: Key, _: TxnId) {
@@ -205,18 +215,7 @@ impl Server {
             }
 
             mem::drop(latch);
-            {
-                // TODO could be moved inside resolve_lock
-                if let Some(txn) = self.txns.try_try_get(lock_id) {
-                    let (_txn_latch, lock_txn) = txn.expect("No txn record?");
-                    let result = self.resolve_lock(lock_id, lock_txn, time);
-                    // eprintln!("post-resolve lock {:?} {:?} {:?}", id, lock_id, result);
-                    result?;
-                } else {
-                    // TODO retry
-                    return Err("Transaction locked".to_owned());
-                }
-            }
+            self.resolve_lock(lock_id, time)?;
 
             // retry
             self.aquire_lock_and_set_value(key, id, txn_record, time, value, true)
@@ -240,12 +239,14 @@ impl Server {
     }
 
     // Postcondition: if returns Ok, then all keys in key's txn are unlocked (including key).
-    fn resolve_lock(
-        &self,
-        txn_id: TxnId,
-        txn_record: &mut TxnRecord,
-        time: Instant,
-    ) -> Result<(), String> {
+    fn resolve_lock(&self, txn_id: TxnId, time: Instant) -> Result<(), String> {
+        let (_txn_latch, txn_record) = if let Some(txn) = self.txns.try_try_get(txn_id) {
+            txn.expect("No txn record?")
+        } else {
+            // TODO retry
+            return Err("Transaction locked".to_owned());
+        };
+
         if time < txn_record.timeout {
             // FIXME return lock time to client so it can resolve and retry.
             return Err("lock still alive".to_owned());
@@ -284,40 +285,25 @@ impl Server {
         self.finalise(txn_id, txn_record)
     }
 
-    fn abort_prewrite(
-        &self,
-        txn_record: &mut TxnRecord,
-        id: TxnId,
-        locked: &[Key],
-    ) -> Result<(), String> {
-        // Unlock any keys we previously locked.
-        for &k in locked {
-            let (_latch, record) = self.keys.try_get(k)?.unwrap();
-            txn_record.keys.remove(&k);
-            if let Some(lock) = record.lock.as_ref() {
-                if lock.id == id {
-                    record.history.push((record.lock.take().unwrap(), false));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn wait_for_consensus() {
+    fn wait_for_consensus() -> Result<(), String> {
         // FIXME actually model the replicas
         let wait_time = rand::thread_rng().gen_range(MIN_CONSENSUS_TIME, MAX_CONSENSUS_TIME);
         thread::sleep(Duration::from_millis(wait_time));
+        if network_failure() {
+            // Could be due to network failure or a conflict in Raft.
+            Err("Consensus failure".to_owned())
+        } else {
+            Ok(())
+        }
     }
 
-    // TODO never returns Err
-    fn update_lock_state(&self, key: Key, id: TxnId) -> Result<(), String> {
+    fn update_lock_state(&self, key: Key, id: TxnId) {
         let (_latch, txn_record) = self
             .txns
             .blocking_get(id)
             .expect(&format!("Transaction {:?} missing {:?}", id, key));
         if txn_record.commit_state != TxnState::Local {
-            return Ok(());
+            return;
         }
 
         {
@@ -327,7 +313,7 @@ impl Server {
                 _ => {
                     // Key has been unlocked (and possibly re-locked), which means the transaction
                     // has been rolled back.
-                    return Ok(());
+                    return;
                 }
             }
         }
@@ -338,39 +324,35 @@ impl Server {
         }
 
         // println!("got consensus {:?} {:?}", key, id);
+    }
+
+    fn async_consensus_write_lock(&self, msg: &messages::LockRequest) -> Result<(), String> {
+        Server::wait_for_consensus()?;
+
+        self.update_lock_state(msg.key, msg.id);
+        // eprintln!("consensus lock complete {:?} {:?}", msg.id, msg.key);
+        self.respond(msg);
         Ok(())
     }
 
-    fn async_consensus_write_lock(&self, msg: &messages::LockRequest) {
-        Server::wait_for_consensus();
-
-        match self.update_lock_state(msg.key, msg.id) {
-            Ok(_) => {
-                // eprintln!("consensus lock complete {:?} {:?}", msg.id, msg.key);
-                self.respond(msg);
-            }
-            Err(s) => self.fail(msg, s),
-        }
-    }
-
-    fn async_consensus_write_prewrite(&self, msg: &messages::PrewriteRequest) {
+    fn async_consensus_write_prewrite(
+        &self,
+        msg: &messages::PrewriteRequest,
+    ) -> Result<(), String> {
         // Assumes we do one consensus write for all writes in the transaction.
-        Server::wait_for_consensus();
+        Server::wait_for_consensus()?;
 
         for &(k, _) in &msg.writes {
-            if let Err(s) = self.update_lock_state(k, msg.id) {
-                eprintln!("update lock failed {:?} {}", msg.id, s);
-                // Leaves keys locked without a txn, but that should get sorted out when we rollback.
-                self.fail(msg, s);
-                return;
-            }
+            self.update_lock_state(k, msg.id);
         }
+
         // eprintln!(
         //     "consensus prewrite complete {:?} {:?}",
         //     msg.id, msg.writes
         // );
 
         self.respond(msg);
+        Ok(())
     }
 
     fn finalise(&self, txn_id: TxnId, txn_record: &mut TxnRecord) -> Result<(), String> {
@@ -466,7 +448,6 @@ impl Server {
         txn_record.commit_state = TxnState::RollingBack;
         // eprintln!("rollback request {:?}", msg.id);
         self.rollback(msg.id, txn_record)
-        // TODO ack?
     }
 
     fn ack<T: MsgRequest>(&self, msg: &T) {

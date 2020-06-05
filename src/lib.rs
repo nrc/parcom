@@ -1,6 +1,5 @@
 // TODO
 //
-// consensus write after failure
 // retries
 // for_update_ts and partial retries
 // non-locking reads (and the reading part of locking reads)
@@ -17,6 +16,7 @@
 #![feature(type_ascription)]
 #![feature(vec_remove_item)]
 
+use rand::Rng;
 use std::{
     sync::{Arc, Mutex},
     thread,
@@ -39,6 +39,8 @@ const TXNS: usize = 10;
 const MAX_KEY: usize = 1000;
 const MIN_CONSENSUS_TIME: u64 = 10;
 const MAX_CONSENSUS_TIME: u64 = 100;
+// Percentage of failing requests.
+const NETWORK_FAILURE_RATE: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct Tso {
@@ -67,6 +69,11 @@ impl Tso {
         *next += 1;
         result
     }
+}
+
+fn network_failure() -> bool {
+    let r = rand::thread_rng().gen_range(0, 100);
+    r < NETWORK_FAILURE_RATE
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
