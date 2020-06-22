@@ -1,3 +1,4 @@
+use crate::messages::MsgRequest;
 use crate::*;
 use rand::{self, Rng};
 use std::{
@@ -31,27 +32,20 @@ impl Client {
     }
 
     pub fn shutdown(&self) {
-        let mut sleep_count = 100;
-        while self.pending.load(Ordering::SeqCst) > 0 {
-            if sleep_count == 0 {
+        self.wait_for_pending(|| {
+            println!(
+                "shutdown timed out {} transactions pending",
+                self.pending.load(Ordering::SeqCst)
+            );
+            for id in 0..TXNS {
+                let txn = self.txns.get_unsafe(TxnId(id));
                 println!(
-                    "shutdown timed out {} transactions pending",
-                    self.pending.load(Ordering::SeqCst)
+                    "{}: {}",
+                    id,
+                    txn.map(|t| t.status()).unwrap_or("no txn".to_owned())
                 );
-                for id in 0..TXNS {
-                    let txn = self.txns.get_unsafe(TxnId(id));
-                    println!(
-                        "{}: {}",
-                        id,
-                        txn.map(|t| t.status()).unwrap_or("no txn".to_owned())
-                    );
-                }
-                break;
             }
-
-            sleep_count -= 1;
-            thread::sleep(Duration::from_millis(100));
-        }
+        });
 
         self.transport.shutdown();
     }
@@ -68,6 +62,7 @@ impl Client {
             let key = self.exec_lock(id, start_ts);
             txn.locks.push((key, false));
         }
+
         // TODO block waiting for acks (currently ignored). Retry if no ack.
         let keys = self.exec_prewrite(id, start_ts);
         txn.prewrite = Some((keys, false));
@@ -78,33 +73,33 @@ impl Client {
     fn exec_lock(&self, id: TxnId, start_ts: Ts) -> Key {
         let key = random_key();
         let now = Instant::now();
-        let msg = messages::LockRequest {
-            id,
+
+        self.send(messages::LockRequest::new(
             key,
+            id,
             start_ts,
-            for_update_ts: self.tso.ts(),
-            current_time: now,
-            timeout: now + Duration::from_millis(500),
-        };
-        self.transport.send(Box::new(msg));
+            now,
+            now + Duration::from_millis(500),
+            self.tso.ts(),
+        ));
+
         key
     }
 
     fn exec_prewrite(&self, id: TxnId, start_ts: Ts) -> Vec<Key> {
-        let writes: Vec<_> = (0..WRITES_PER_TXN)
-            .map(|_| (random_key(), random_value()))
-            .collect();
+        let writes = random_writes();
         let keys = writes.iter().map(|&(k, _)| k).collect();
         let now = Instant::now();
-        let msg = messages::PrewriteRequest {
+
+        self.send(messages::PrewriteRequest::new(
             id,
             start_ts,
-            commit_ts: self.tso.ts(),
+            self.tso.ts(),
+            now,
+            now + Duration::from_millis(500),
             writes,
-            current_time: now,
-            timeout: now + Duration::from_millis(500),
-        };
-        self.transport.send(Box::new(msg));
+        ));
+
         keys
     }
 
@@ -113,14 +108,11 @@ impl Client {
         if !msg.success {
             return self.rollback(msg.id);
         }
-        self.txns
-            .blocking_get(msg.id)
-            .unwrap()
-            .1
-            .prewrite
-            .as_mut()
-            .unwrap()
-            .1 = true;
+
+        self.with_txn(msg.id, |_, txn| {
+            txn.prewrite.as_mut().unwrap().1 = true;
+        });
+
         self.check_responses_and_commit(msg.id);
     }
 
@@ -129,8 +121,8 @@ impl Client {
         if !msg.success {
             return self.rollback(msg.id);
         }
-        {
-            let (_latch, txn) = self.txns.blocking_get(msg.id).unwrap();
+
+        self.with_txn(msg.id, |_, txn| {
             if txn.rolled_back {
                 return;
             }
@@ -139,37 +131,57 @@ impl Client {
                     *b = true;
                 }
             }
-        }
+        });
+
         self.check_responses_and_commit(msg.id);
     }
 
     fn check_responses_and_commit(&self, id: TxnId) {
-        let (_latch, txn) = self.txns.blocking_get(id).unwrap();
-        if !txn.complete() || txn.rolled_back || txn.committed {
-            return;
-        }
-        // At this point we can communicate success to the user.
-        txn.committed = true;
+        self.with_txn(id, |this, txn| {
+            if !txn.complete() || txn.rolled_back || txn.committed {
+                return;
+            }
+            // At this point we can communicate success to the user.
+            txn.committed = true;
 
-        let msg = messages::FinaliseRequest { id };
-        self.transport.send(Box::new(msg));
-        self.pending.fetch_sub(1, Ordering::SeqCst);
+            this.send(messages::FinaliseRequest::new(id));
+            this.pending.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 
     fn rollback(&self, id: TxnId) {
-        let (_latch, txn) = self.txns.blocking_get(id).unwrap();
-        if txn.rolled_back {
-            return;
-        }
-        assert!(!txn.complete() && !txn.committed);
-        txn.rolled_back = true;
+        self.with_txn(id, |this, txn| {
+            if txn.rolled_back {
+                return;
+            }
+            assert!(!txn.complete() && !txn.committed);
+            txn.rolled_back = true;
 
-        let msg = messages::RollbackRequest {
-            id,
-            keys: txn.keys(),
-        };
-        self.transport.send(Box::new(msg));
-        self.pending.fetch_sub(1, Ordering::SeqCst);
+            this.send(messages::RollbackRequest::new(id, txn.keys()));
+            this.pending.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
+    fn with_txn(&self, id: TxnId, f: impl FnOnce(&Client, &mut Txn)) {
+        let (_latch, txn) = self.txns.blocking_get(id).unwrap();
+        f(self, txn);
+    }
+
+    fn wait_for_pending(&self, failure: impl Fn()) {
+        let mut sleep_count = 100;
+        while self.pending.load(Ordering::SeqCst) > 0 {
+            if sleep_count == 0 {
+                failure();
+                break;
+            }
+
+            sleep_count -= 1;
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn send(&self, msg: impl MsgRequest + Send + 'static) {
+        self.transport.send(Box::new(msg))
     }
 }
 
@@ -220,6 +232,12 @@ fn random_key() -> Key {
 
 fn random_value() -> Value {
     Value(rand::random())
+}
+
+fn random_writes() -> Vec<(Key, Value)> {
+    (0..WRITES_PER_TXN)
+        .map(|_| (random_key(), random_value()))
+        .collect()
 }
 
 struct Txn {

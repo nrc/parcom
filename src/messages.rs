@@ -1,4 +1,5 @@
 use crate::*;
+use derive_new::new;
 use std::time::Instant;
 
 pub trait MsgRequest {
@@ -13,7 +14,7 @@ pub trait MsgRequest {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, new)]
 pub struct LockRequest {
     pub key: Key,
     pub id: TxnId,
@@ -57,7 +58,7 @@ pub struct LockResponse {
     pub success: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, new)]
 pub struct PrewriteRequest {
     pub id: TxnId,
     pub start_ts: Ts,
@@ -95,7 +96,7 @@ pub struct PrewriteResponse {
     pub success: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, new)]
 pub struct FinaliseRequest {
     pub id: TxnId,
 }
@@ -109,7 +110,7 @@ impl MsgRequest for FinaliseRequest {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, new)]
 pub struct RollbackRequest {
     pub id: TxnId,
     pub keys: Vec<Key>,
