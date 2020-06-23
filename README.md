@@ -4,7 +4,6 @@
 
 * Use futures instead of threads
 * Fix resolve lock
-* Can the code be made more declarative?
 * Implement other transactions models
 
 ## Questions

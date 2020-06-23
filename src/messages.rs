@@ -14,6 +14,12 @@ pub trait MsgRequest {
     }
 }
 
+pub trait TxnRequest: MsgRequest {
+    fn id(&self) -> TxnId;
+    fn start_ts(&self) -> Ts;
+    fn timeout(&self) -> Instant;
+}
+
 #[derive(Debug, Clone, new)]
 pub struct LockRequest {
     pub key: Key,
@@ -41,6 +47,20 @@ impl MsgRequest for LockRequest {
             id: self.id,
             success,
         })
+    }
+}
+
+impl TxnRequest for LockRequest {
+    fn id(&self) -> TxnId {
+        self.id
+    }
+
+    fn start_ts(&self) -> Ts {
+        self.start_ts
+    }
+
+    fn timeout(&self) -> Instant {
+        self.timeout
     }
 }
 
@@ -81,6 +101,20 @@ impl MsgRequest for PrewriteRequest {
             id: self.id,
             success,
         })
+    }
+}
+
+impl TxnRequest for PrewriteRequest {
+    fn id(&self) -> TxnId {
+        self.id
+    }
+
+    fn start_ts(&self) -> Ts {
+        self.start_ts
+    }
+
+    fn timeout(&self) -> Instant {
+        self.timeout
     }
 }
 
